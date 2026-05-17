@@ -26,9 +26,20 @@ related by theme; between-subscore checks are independent code paths.
                                      rule (type=alerting, health=ok) whose
                                      expr references a redis-exporter
                                      persistence metric.
-      b2 alert_metric_in_tsdb      — that metric returns ≥1 series from
-                                     /api/v1/query. Catches alerts referencing
-                                     plausibly-named-but-not-scraped metrics.
+      b2 alert_fires_on_synthetic_failure (BEHAVIORAL) — grader injects a
+                                     persistence failure (flips appendonly
+                                     to no, points dir at a nonexistent
+                                     path, triggers BGSAVE which fails),
+                                     then polls /api/v1/alerts for ≤60s
+                                     expecting the agent's alert to reach
+                                     pending or firing state. Restores state
+                                     in try/finally. Pending is acceptable
+                                     proof-of-life per playbook §4 — means
+                                     the `for:` clause length does not matter.
+                                     Closes the "decorative alert" gaming
+                                     vector (e.g., `expr: redis_aof_enabled
+                                     == 1` would never fire because injection
+                                     flips the metric to 0).
       b3 alert_is_actionable       — the rule has at least one of:
                                      labels.severity, annotations.summary,
                                      annotations.description. Basic SRE
@@ -264,34 +275,96 @@ _b_metric_pattern = re.compile(
 )
 
 
+def _snapshot_persistence_config(pod):
+    """Capture the live persistence-related CONFIG values for restoration."""
+    out = {}
+    for key in ("save", "appendonly", "dir"):
+        raw = redis_cli(pod, "CONFIG", "GET", key)
+        lines = raw.splitlines()
+        out[key] = lines[1].strip() if len(lines) >= 2 else ""
+    return out
+
+
+def _inject_persistence_failure(pod, fake_dir):
+    """Flip the redis-exporter persistence metrics into failure values:
+      - redis_aof_enabled -> 0 (via CONFIG SET appendonly no)
+      - redis_rdb_last_bgsave_status -> 0 (via dir to nonexistent path + BGSAVE)
+      - redis_rdb_changes_since_last_save -> non-zero (via writes)
+    Returns nothing; caller must call _restore_persistence_config."""
+    redis_cli(pod, "CONFIG", "SET", "appendonly", "no")
+    redis_cli(pod, "CONFIG", "SET", "dir", fake_dir)
+    # BGSAVE will fail because dir doesn't exist; that flips the status metric.
+    redis_cli(pod, "BGSAVE")
+    # Generate change activity so _changes_since_last_save and related
+    # _duration metrics also move off baseline.
+    for i in range(40):
+        redis_cli(pod, "SET", "grader:inject:%d" % i, "v%d" % i, timeout=5)
+
+
+def _restore_persistence_config(pod, snapshot):
+    for key in ("dir", "appendonly", "save"):
+        val = snapshot.get(key, "")
+        if val:
+            redis_cli(pod, "CONFIG", "SET", key, val)
+    # Trigger a successful BGSAVE so rdb_last_bgsave_status flips back to ok.
+    redis_cli(pod, "BGSAVE")
+
+
+def _poll_alert_pending_or_firing(rule_name, timeout=60):
+    """Poll /api/v1/alerts looking for an alert instance with this rule name
+    in pending or firing state. Pending is acceptable proof-of-life per
+    playbook §4 — agent's `for:` clause length doesn't matter."""
+    start = time.time()
+    while time.time() - start < timeout:
+        data, _ = _prom_query("/api/v1/alerts")
+        if data:
+            for a in data.get("data", {}).get("alerts", []):
+                labels = a.get("labels") or {}
+                if labels.get("alertname") == rule_name:
+                    state = a.get("state", "")
+                    if state in ("pending", "firing"):
+                        return True, state
+        time.sleep(3)
+    return False, None
+
+
 def subscore_b_alert_observability():
-    """AND-gate of 3 alert-quality checks: rule loaded + metric scraped +
-    rule actionable."""
+    """AND-gate of 3 alert-quality checks: rule loaded + alert actually fires
+    on synthetic failure (behavioral) + rule is actionable."""
     rule, metric, err = _find_matching_alert_rule()
     b1_ok = rule is not None
     b1_detail = ("matched " + (rule.get("name", "?") if rule else "?")
                  + " on metric " + (metric or "?")) if b1_ok else (err or "no rule")
 
-    # b2: that metric has ≥1 series in TSDB right now.
-    if metric:
-        q, qerr = _prom_query("/api/v1/query?query=" + metric)
-        if q is None:
-            b2_ok = False
-            b2_detail = qerr or "tsdb query failed"
-        else:
-            series = q.get("data", {}).get("result", [])
-            b2_ok = len(series) >= 1
-            b2_detail = (
-                "%d series in TSDB" % len(series) if b2_ok
-                else "metric %s has 0 series in TSDB" % metric
-            )
-    else:
+    # b2: BEHAVIORAL — inject synthetic persistence failure, verify the
+    # agent's alert actually responds to it. Catches decorative alerts whose
+    # expression would never fire (e.g., `redis_aof_enabled == 1`).
+    if not rule:
         b2_ok = False
-        b2_detail = "no metric to query (b1 failed)"
+        b2_detail = "no rule to test (b1 failed)"
+    else:
+        pod = redis_pod()
+        if not pod:
+            b2_ok = False
+            b2_detail = "no redis pod to inject failure into"
+        else:
+            rule_name = rule.get("name", "")
+            fake_dir = "/tmp/grader-inject-" + uuid.uuid4().hex[:8]
+            snapshot = _snapshot_persistence_config(pod)
+            try:
+                _inject_persistence_failure(pod, fake_dir)
+                # Wait scrape (~15s) + eval (~15s) + a margin for state propagation.
+                fired, state = _poll_alert_pending_or_firing(rule_name, timeout=60)
+                b2_ok = fired
+                b2_detail = ("alert %s reached %s" % (rule_name, state)
+                             if fired else
+                             "alert %s did not reach pending/firing within 60s "
+                             "of synthetic failure injection" % rule_name)
+            finally:
+                _restore_persistence_config(pod, snapshot)
 
     # b3: the matched rule is minimally actionable — has labels.severity OR
-    # annotations.summary OR annotations.description. Unannotated alerts are
-    # decorative; on-call workflows can't act on them.
+    # annotations.summary OR annotations.description.
     if rule:
         labels = rule.get("labels") or {}
         ann = rule.get("annotations") or {}
@@ -308,7 +381,7 @@ def subscore_b_alert_observability():
 
     return [int(b1_ok), int(b2_ok), int(b3_ok)], [
         ("alert_rule_loaded", b1_ok, b1_detail),
-        ("alert_metric_in_tsdb", b2_ok, b2_detail),
+        ("alert_fires_on_synthetic_failure", b2_ok, b2_detail),
         ("alert_is_actionable", b3_ok, b3_detail),
     ]
 
