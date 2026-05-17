@@ -1,56 +1,36 @@
 """Grader for redis-persistence-drift.
 
-Two equal-weight, binary, orthogonal subscores. Each is an AND-gate of 3
-related-but-non-redundant checks (Master Guide §3 + AGENT_DIFFICULTY_BANK_v2
-Pattern 6 "AND-Gate with Mixed Difficulty"). Within-subscore checks are
-related by theme; between-subscore checks are independent code paths.
+Two equal-weight, binary, orthogonal subscores. Each is an AND-gate of two
+related but independent checks. Within-subscore checks share a theme;
+between-subscore checks are independent code paths.
 
-  A persistence_durability  (FUNCTIONAL AND-gate, weight 0.5)
-      a1 string_survives_restart   — STRING key, BGSAVE+BGREWRITEAOF, kill,
-                                     GET. Baseline behavioral probe; passes
-                                     if any persistence + PVC is wired up.
-      a2 hash_survives_restart     — HSET hash field in the SAME restart
-                                     cycle; HGET on the new pod. Tests data
-                                     type breadth.
-      a3 unflushed_probe_survives  — SET key with NO manual BGSAVE /
-                                     BGREWRITEAOF. Poll for aof_pending_bio_
-                                     fsync:0 or rdb_changes_since_last_save:0
-                                     (i.e., the agent's own save policy /
-                                     appendfsync caused durability). Kill,
-                                     GET. Distinguishes agents who configured
-                                     real persistence policy from agents who
-                                     would only pass under manual flushes.
+  A persistence_durability  (weight 0.5)
+      a1 baseline_survives_restart
+         STRING key with manual BGSAVE+BGREWRITEAOF, kill pod, GET.
+         Passes if PVC is mounted and either persistence mechanism works.
+      a2 unflushed_probe_survives
+         SET key with NO manual flush. Poll INFO persistence for
+         aof_pending_bio_fsync:0 or rdb_changes_since_last_save:0 so the
+         agent's own save policy / appendfsync is what makes the write
+         durable. Kill pod, GET. Fails if the agent's live config does
+         not actually persist writes between save events.
 
-  B alert_observability     (NON-FUNCTIONAL AND-gate, weight 0.5)
-      b1 alert_rule_loaded         — Prometheus /api/v1/rules has an alerting
-                                     rule (type=alerting, health=ok) whose
-                                     expr references a redis-exporter
-                                     persistence metric.
-      b2 alert_fires_on_synthetic_failure (BEHAVIORAL) — grader injects a
-                                     persistence failure (flips appendonly
-                                     to no, points dir at a nonexistent
-                                     path, triggers BGSAVE which fails),
-                                     then polls /api/v1/alerts for ≤60s
-                                     expecting the agent's alert to reach
-                                     pending or firing state. Restores state
-                                     in try/finally. Pending is acceptable
-                                     proof-of-life per playbook §4 — means
-                                     the `for:` clause length does not matter.
-                                     Closes the "decorative alert" gaming
-                                     vector (e.g., `expr: redis_aof_enabled
-                                     == 1` would never fire because injection
-                                     flips the metric to 0).
-      b3 alert_is_actionable       — the rule has at least one of:
-                                     labels.severity, annotations.summary,
-                                     annotations.description. Basic SRE
-                                     hygiene; an unannotated rule pages
-                                     nobody useful.
+  B alert_observability     (weight 0.5)
+      b1 alert_rule_loaded
+         Prometheus /api/v1/rules has an alerting rule (type=alerting,
+         health=ok) whose expr references a redis-exporter persistence
+         metric in the accepted set.
+      b2 alert_fires_on_synthetic_failure  (BEHAVIORAL)
+         Inject failure (flip appendonly to no, disable save policy,
+         write 200 keys), poll /api/v1/alerts up to 60s expecting the
+         agent's alert to reach pending or firing. Pending counts; the
+         for: clause length does not matter. State restored in finally.
+         A decorative `expr: redis_aof_enabled == 1` would not fire,
+         because the injection flips the metric to 0.
 
-A and B do not share underlying state: agent can pass A while failing B
-(fixes redis, skips monitoring) or pass B while failing A (writes alert,
-doesn't fix redis). Within each subscore, AND-gate multiplies individual
-pass rates (per difficulty bank §"Multiplication Trick Math Table"), giving
-each subscore variance even on capable agents.
+A and B do not share state: an agent can pass A while failing B (fixes
+redis, skips monitoring) or pass B while failing A (writes alert, does
+not fix redis). All four cells of the joint distribution are reachable.
 """
 
 import json
@@ -160,66 +140,56 @@ def _poll_unflushed_durable(pod, timeout=15):
 
 
 def subscore_a_persistence_durability():
-    """AND-gate of 3 behavioral probes, all within ONE pod restart cycle."""
+    """AND-gate of 2 probes, both within ONE pod restart cycle.
+    a1 baseline_survives_restart   — manual BGSAVE+BGREWRITEAOF, then kill.
+    a2 unflushed_probe_survives    — no manual flush, relies on agent's
+                                     live save policy / appendfsync.
+    """
     pod = wait_for_redis(timeout=120)
     if not pod:
-        return [0, 0, 0], [
-            ("string_survives_restart", False, "no redis pre-probe"),
-            ("hash_survives_restart", False, "no redis pre-probe"),
+        return [0, 0], [
+            ("baseline_survives_restart", False, "no redis pre-probe"),
             ("unflushed_probe_survives", False, "no redis pre-probe"),
         ]
 
-    # a1: string key (flushed via BGSAVE+BGREWRITEAOF below)
-    a1_key = "grader:str:" + uuid.uuid4().hex
+    # a1: probe key, then force a manual flush via BGSAVE+BGREWRITEAOF.
+    a1_key = "grader:base:" + uuid.uuid4().hex
     a1_val = uuid.uuid4().hex
     redis_cli(pod, "SET", a1_key, a1_val)
-
-    # a2: hash key (same flush path)
-    a2_key = "grader:hash:" + uuid.uuid4().hex
-    a2_field = "probe"
-    a2_val = uuid.uuid4().hex
-    redis_cli(pod, "HSET", a2_key, a2_field, a2_val)
-
-    # Force-flush a1 + a2 via manual BGSAVE + BGREWRITEAOF (polling, no bare sleep).
     _poll_bgsave_done(pod, timeout=30)
     _poll_aof_rewrite_done(pod, timeout=15)
 
-    # a3: probe key written AFTER the manual flush. We do NOT call BGSAVE or
+    # a2: probe key written AFTER the manual flush. We do NOT call BGSAVE or
     # BGREWRITEAOF again — survival depends on the agent's live save policy
     # and/or appendfsync getting this write to disk before the kill.
-    a3_key = "grader:noflush:" + uuid.uuid4().hex
-    a3_val = uuid.uuid4().hex
-    redis_cli(pod, "SET", a3_key, a3_val)
-    a3_durable = _poll_unflushed_durable(pod, timeout=15)
+    a2_key = "grader:noflush:" + uuid.uuid4().hex
+    a2_val = uuid.uuid4().hex
+    redis_cli(pod, "SET", a2_key, a2_val)
+    a2_durable = _poll_unflushed_durable(pod, timeout=15)
 
-    # Single force-delete exercises all three probes at once.
+    # Single force-delete exercises both probes at once.
     run(KUBECTL + ["delete", "pod", pod, "--force", "--grace-period=0"], timeout=60)
 
     new_pod = wait_for_redis(timeout=180)
     if not new_pod:
-        return [0, 0, 0], [
-            ("string_survives_restart", False, "redis did not recover"),
-            ("hash_survives_restart", False, "redis did not recover"),
+        return [0, 0], [
+            ("baseline_survives_restart", False, "redis did not recover"),
             ("unflushed_probe_survives", False, "redis did not recover"),
         ]
 
     a1_got = redis_cli(new_pod, "GET", a1_key)
-    a2_got = redis_cli(new_pod, "HGET", a2_key, a2_field)
-    a3_got = redis_cli(new_pod, "GET", a3_key)
+    a2_got = redis_cli(new_pod, "GET", a2_key)
 
     a1_ok = a1_got == a1_val
-    a2_ok = a2_got == a2_val
-    a3_ok = a3_got == a3_val and a3_durable
+    a2_ok = a2_got == a2_val and a2_durable
 
-    a3_detail = "survived" if a3_ok else (
-        "value lost (durability poll=%s, got=%r)" % (a3_durable, a3_got)
+    a2_detail = "survived" if a2_ok else (
+        "value lost (durability poll=%s, got=%r)" % (a2_durable, a2_got)
     )
-    return [int(a1_ok), int(a2_ok), int(a3_ok)], [
-        ("string_survives_restart", a1_ok,
-         "string round-trip" if a1_ok else "got=%r" % a1_got),
-        ("hash_survives_restart", a2_ok,
-         "hash round-trip" if a2_ok else "got=%r" % a2_got),
-        ("unflushed_probe_survives", a3_ok, a3_detail),
+    return [int(a1_ok), int(a2_ok)], [
+        ("baseline_survives_restart", a1_ok,
+         "round-trip" if a1_ok else "got=%r" % a1_got),
+        ("unflushed_probe_survives", a2_ok, a2_detail),
     ]
 
 
@@ -310,8 +280,8 @@ def _restore_persistence_config(pod, snapshot):
 
 def _poll_alert_pending_or_firing(rule_name, timeout=60):
     """Poll /api/v1/alerts looking for an alert instance with this rule name
-    in pending or firing state. Pending is acceptable proof-of-life per
-    playbook §4 — agent's `for:` clause length doesn't matter."""
+    in pending or firing state. Pending counts as proof-of-life; the rule's
+    `for:` clause length therefore does not matter."""
     start = time.time()
     while time.time() - start < timeout:
         data, _ = _prom_query("/api/v1/alerts")
@@ -327,8 +297,10 @@ def _poll_alert_pending_or_firing(rule_name, timeout=60):
 
 
 def subscore_b_alert_observability():
-    """AND-gate of 3 alert-quality checks: rule loaded + alert actually fires
-    on synthetic failure (behavioral) + rule is actionable."""
+    """AND-gate of 2 checks:
+      b1 alert_rule_loaded                  — rule exists with accepted metric.
+      b2 alert_fires_on_synthetic_failure   — behavioral; inject + poll alerts.
+    """
     rule, metric, err = _find_matching_alert_rule()
     b1_ok = rule is not None
     b1_detail = ("matched " + (rule.get("name", "?") if rule else "?")
@@ -336,7 +308,7 @@ def subscore_b_alert_observability():
 
     # b2: BEHAVIORAL — inject synthetic persistence failure, verify the
     # agent's alert actually responds to it. Catches decorative alerts whose
-    # expression would never fire (e.g., `redis_aof_enabled == 1`).
+    # expression would never fire (e.g., expr: redis_aof_enabled == 1).
     if not rule:
         b2_ok = False
         b2_detail = "no rule to test (b1 failed)"
@@ -350,7 +322,7 @@ def subscore_b_alert_observability():
             snapshot = _snapshot_persistence_config(pod)
             try:
                 _inject_persistence_failure(pod)
-                # Wait scrape (~15s) + eval (~15s) + a margin for state propagation.
+                # Wait for scrape + eval cycles + propagation margin.
                 fired, state = _poll_alert_pending_or_firing(rule_name, timeout=60)
                 b2_ok = fired
                 b2_detail = ("alert %s reached %s" % (rule_name, state)
@@ -360,26 +332,9 @@ def subscore_b_alert_observability():
             finally:
                 _restore_persistence_config(pod, snapshot)
 
-    # b3: the matched rule is minimally actionable — has labels.severity OR
-    # annotations.summary OR annotations.description.
-    if rule:
-        labels = rule.get("labels") or {}
-        ann = rule.get("annotations") or {}
-        has_sev = bool(labels.get("severity"))
-        has_summary = bool(ann.get("summary"))
-        has_desc = bool(ann.get("description"))
-        b3_ok = has_sev or has_summary or has_desc
-        b3_detail = ("severity=%s summary=%s description=%s" %
-                     (labels.get("severity"), ann.get("summary"),
-                      ann.get("description"))) if b3_ok else "no severity / summary / description"
-    else:
-        b3_ok = False
-        b3_detail = "no rule to inspect (b1 failed)"
-
-    return [int(b1_ok), int(b2_ok), int(b3_ok)], [
+    return [int(b1_ok), int(b2_ok)], [
         ("alert_rule_loaded", b1_ok, b1_detail),
         ("alert_fires_on_synthetic_failure", b2_ok, b2_detail),
-        ("alert_is_actionable", b3_ok, b3_detail),
     ]
 
 

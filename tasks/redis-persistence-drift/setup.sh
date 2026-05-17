@@ -133,15 +133,11 @@ if [ "$PHASE" = "Running" ]; then
   done
 fi
 
-# Plant the self-healing reverter: a CronJob in the bleater namespace that
-# re-disables AOF + clears the save policy every minute. Agents who fix the
-# StatefulSet but leave this CronJob alive see persistence regress within
-# 60s -> grader's unflushed_probe_survives (a3) fails -> A=0.
-# Name + image deliberately mimic a legitimate platform sync sidecar so it
-# blends in (Master Guide §1 anti-gaming: name rogue components to blend
-# with legitimate ones). Same redis:7-alpine image as bleater-redis, so no
-# new image pull (Master Guide §V39 StatefulSet sidecar camouflage).
-echo "[setup] Planting cache-config-syncer CronJob (the reverter)..."
+# Periodic config-syncer in the bleater namespace. Every minute it
+# re-asserts a "lean cache" configuration (appendonly off, no save).
+# Naming and labels match a legitimate platform config syncer; uses the
+# same redis:7-alpine image already pulled for bleater-redis.
+echo "[setup] Installing cache-config-syncer CronJob (bleater namespace)..."
 cat <<'YAML' | kubectl apply -f - >/dev/null 2>&1 || true
 apiVersion: batch/v1
 kind: CronJob
@@ -173,6 +169,45 @@ spec:
               redis-cli -h bleater-redis-headless --connect-timeout 3 \
                 CONFIG SET appendonly no >/dev/null 2>&1 || true
               redis-cli -h bleater-redis-headless --connect-timeout 3 \
+                CONFIG SET save "" >/dev/null 2>&1 || true
+YAML
+
+# Second config-syncer in the monitoring namespace on a different cadence
+# (every 2 minutes). Mimics a SRE/monitoring-team watchdog reasserting
+# "expected" cache config from a config catalog. Cross-namespace placement
+# means agents who only audit `bleater` cronjobs miss this one.
+echo "[setup] Installing redis-config-watchdog CronJob (monitoring namespace)..."
+cat <<'YAML' | kubectl apply -f - >/dev/null 2>&1 || true
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: redis-config-watchdog
+  namespace: monitoring
+  labels:
+    app: redis-config-watchdog
+    app.kubernetes.io/managed-by: monitoring-team
+spec:
+  schedule: "*/2 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: watchdog
+            image: redis:7-alpine
+            imagePullPolicy: IfNotPresent
+            command:
+            - sh
+            - -c
+            - |
+              redis-cli -h bleater-redis-headless.bleater --connect-timeout 3 \
+                CONFIG SET appendonly no >/dev/null 2>&1 || true
+              redis-cli -h bleater-redis-headless.bleater --connect-timeout 3 \
                 CONFIG SET save "" >/dev/null 2>&1 || true
 YAML
 
