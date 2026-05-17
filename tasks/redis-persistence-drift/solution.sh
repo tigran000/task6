@@ -5,7 +5,7 @@ NS="bleater"
 STS="bleater-redis"
 POD="bleater-redis-0"
 PROM_NS="monitoring"
-GITEA_URL="http://gitea.devops.local"
+GITEA_URL="http://gitea.devops.local:3000"
 GITEA_USER="root"
 GITEA_PASS="Admin@123456"
 

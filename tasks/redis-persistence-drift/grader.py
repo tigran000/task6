@@ -135,15 +135,24 @@ def subscore_b_alert_rule_loaded():
     prometheus pod. Match on metric NAME in the rule's expression, not on
     the alert's user-chosen title. No PrometheusRule CRD exists on this
     snapshot, so there is no CRD fallback."""
-    # Accept any of the four canonical redis-exporter persistence-health
-    # metrics. An alert keyed on any of them is a legitimate "page when
-    # durability regresses" signal.
+    # Accept any redis-exporter persistence-related metric. An alert keyed
+    # on any of these is a legitimate "page when durability regresses" signal.
+    # Includes both the _status / _timestamp metrics (canonical durability
+    # signals) and the _duration_sec / _rewrite_in_progress family (which the
+    # reviewer's enumeration confirmed are actually scraped on this snapshot).
     metric_pattern = re.compile(
         r"redis_("
-        r"rdb_last_bgsave_status"          # RDB BGSAVE failures
-        r"|aof_last_write_status"          # AOF write failures
+        r"rdb_last_bgsave_status"            # RDB BGSAVE failures
+        r"|aof_last_write_status"            # AOF write failures
         r"|rdb_last_save_timestamp_seconds"  # snapshots not happening
-        r"|rdb_changes_since_last_save"    # save policy broken / not snapshotting
+        r"|rdb_changes_since_last_save"      # save policy broken
+        r"|rdb_last_bgsave_duration_sec"     # RDB write took unusually long
+        r"|rdb_current_bgsave_duration_sec"  # RDB save still in flight
+        r"|aof_last_rewrite_duration_sec"    # AOF rewrite latency
+        r"|aof_current_rewrite_duration_sec" # AOF rewrite in flight
+        r"|aof_enabled"                      # AOF turned off
+        r"|rdb_bgsave_in_progress"           # snapshot stuck
+        r"|aof_rewrite_in_progress"          # rewrite stuck
         r")"
     )
     cmd = [

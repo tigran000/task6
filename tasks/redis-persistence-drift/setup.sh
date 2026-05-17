@@ -28,7 +28,7 @@ NS="bleater"
 STS="bleater-redis"
 POD="bleater-redis-0"
 PVC="data-bleater-redis-0"
-GITEA_URL="http://gitea.devops.local"
+GITEA_URL="http://gitea.devops.local:3000"
 GITEA_USER="root"
 GITEA_PASS="Admin@123456"
 
