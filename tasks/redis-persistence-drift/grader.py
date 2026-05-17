@@ -191,8 +191,16 @@ def b5_alert_rule_loaded():
     prometheus pod. Match on metric NAME in the rule's expression, not on
     the alert's user-chosen title. No PrometheusRule CRD exists on this
     snapshot, so there is no CRD fallback."""
+    # Accept any of the four canonical redis-exporter persistence-health
+    # metrics. An alert keyed on any of them is a legitimate "page when
+    # durability regresses" signal.
     metric_pattern = re.compile(
-        r"redis_(rdb_last_bgsave_status|aof_last_write_status)"
+        r"redis_("
+        r"rdb_last_bgsave_status"          # RDB BGSAVE failures
+        r"|aof_last_write_status"          # AOF write failures
+        r"|rdb_last_save_timestamp_seconds"  # snapshots not happening
+        r"|rdb_changes_since_last_save"    # save policy broken / not snapshotting
+        r")"
     )
     cmd = [
         "kubectl", "-n", PROM_NS, "exec", "deploy/prometheus", "--",
