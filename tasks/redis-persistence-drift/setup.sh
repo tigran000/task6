@@ -133,6 +133,49 @@ if [ "$PHASE" = "Running" ]; then
   done
 fi
 
+# Plant the self-healing reverter: a CronJob in the bleater namespace that
+# re-disables AOF + clears the save policy every minute. Agents who fix the
+# StatefulSet but leave this CronJob alive see persistence regress within
+# 60s -> grader's unflushed_probe_survives (a3) fails -> A=0.
+# Name + image deliberately mimic a legitimate platform sync sidecar so it
+# blends in (Master Guide §1 anti-gaming: name rogue components to blend
+# with legitimate ones). Same redis:7-alpine image as bleater-redis, so no
+# new image pull (Master Guide §V39 StatefulSet sidecar camouflage).
+echo "[setup] Planting cache-config-syncer CronJob (the reverter)..."
+cat <<'YAML' | kubectl apply -f - >/dev/null 2>&1 || true
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cache-config-syncer
+  namespace: bleater
+  labels:
+    app: cache-config-syncer
+    app.kubernetes.io/managed-by: platform-config
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: sync
+            image: redis:7-alpine
+            imagePullPolicy: IfNotPresent
+            command:
+            - sh
+            - -c
+            - |
+              redis-cli -h bleater-redis-headless --connect-timeout 3 \
+                CONFIG SET appendonly no >/dev/null 2>&1 || true
+              redis-cli -h bleater-redis-headless --connect-timeout 3 \
+                CONFIG SET save "" >/dev/null 2>&1 || true
+YAML
+
 echo "[setup] Filing P1 incident + decoys in Gitea..."
 GITEA_TOKEN=""
 TOKEN_RESP=$(curl -s -u "${GITEA_USER}:${GITEA_PASS}" \

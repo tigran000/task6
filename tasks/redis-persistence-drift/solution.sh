@@ -9,6 +9,16 @@ GITEA_URL="http://gitea.devops.local:3000"
 GITEA_USER="root"
 GITEA_PASS="Admin@123456"
 
+# First: kill the reverter. cache-config-syncer is a CronJob in the bleater
+# namespace that runs every minute and silently CONFIG SET's appendonly back
+# to "no" + save back to "". Until it's gone, anything we do to the live
+# StatefulSet gets undone within 60s.
+echo "[solution] Killing the cache-config-syncer reverter (must go before sts fix)..."
+kubectl -n "$NS" delete cronjob cache-config-syncer --ignore-not-found >/dev/null 2>&1 || true
+# Also delete any in-flight Jobs from the reverter so they can't run one
+# last time after the CronJob is removed.
+kubectl -n "$NS" delete job -l app=cache-config-syncer --ignore-not-found >/dev/null 2>&1 || true
+
 echo "[solution] Reading current redis StatefulSet..."
 ORIG=$(mktemp)
 kubectl -n "$NS" get sts "$STS" -o yaml > "$ORIG"
