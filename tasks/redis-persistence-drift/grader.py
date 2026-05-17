@@ -258,55 +258,53 @@ def _find_matching_alert_rule():
     return None, None, "no alerting rule references a redis-exporter persistence metric"
 
 
+# Narrowed to two metrics that respond reliably to live CONFIG SET changes
+# AND are the right alert family for this incident class. The original
+# breakage was 'save policy disabled, appendonly no' — that doesn't cause
+# BGSAVE failures (no save is attempted at all), so _status metrics would
+# never fire and wouldn't have caught the original incident. The right
+# alerts are on CONFIG STATE, not on failure events:
+#   - redis_aof_enabled               → 0 means AOF was turned off
+#   - redis_rdb_changes_since_last_save > N → save policy isn't snapshotting
+# Both metrics are also reliably flippable via CONFIG SET without needing
+# protected-config workarounds (dir/dbfilename are locked in Redis 7+).
 _b_metric_pattern = re.compile(
-    r"redis_("
-    r"rdb_last_bgsave_status"
-    r"|aof_last_write_status"
-    r"|rdb_last_save_timestamp_seconds"
-    r"|rdb_changes_since_last_save"
-    r"|rdb_last_bgsave_duration_sec"
-    r"|rdb_current_bgsave_duration_sec"
-    r"|aof_last_rewrite_duration_sec"
-    r"|aof_current_rewrite_duration_sec"
-    r"|aof_enabled"
-    r"|rdb_bgsave_in_progress"
-    r"|aof_rewrite_in_progress"
-    r")"
+    r"redis_(aof_enabled|rdb_changes_since_last_save)"
 )
 
 
 def _snapshot_persistence_config(pod):
-    """Capture the live persistence-related CONFIG values for restoration."""
+    """Capture live persistence CONFIG values for restoration."""
     out = {}
-    for key in ("save", "appendonly", "dir"):
+    for key in ("save", "appendonly"):
         raw = redis_cli(pod, "CONFIG", "GET", key)
         lines = raw.splitlines()
         out[key] = lines[1].strip() if len(lines) >= 2 else ""
     return out
 
 
-def _inject_persistence_failure(pod, fake_dir):
-    """Flip the redis-exporter persistence metrics into failure values:
-      - redis_aof_enabled -> 0 (via CONFIG SET appendonly no)
-      - redis_rdb_last_bgsave_status -> 0 (via dir to nonexistent path + BGSAVE)
-      - redis_rdb_changes_since_last_save -> non-zero (via writes)
-    Returns nothing; caller must call _restore_persistence_config."""
+def _inject_persistence_failure(pod):
+    """Flip the two reliably-injectable redis-exporter metrics into failure
+    states. `dir` and `dbfilename` are protected in Redis 7+, so we use the
+    two metrics we CAN control via CONFIG SET:
+      - redis_aof_enabled  → 0  (CONFIG SET appendonly no)
+      - redis_rdb_changes_since_last_save → grows (writes + save policy off)
+    Caller must call _restore_persistence_config in finally."""
+    redis_cli(pod, "CONFIG", "SET", "save", "")
     redis_cli(pod, "CONFIG", "SET", "appendonly", "no")
-    redis_cli(pod, "CONFIG", "SET", "dir", fake_dir)
-    # BGSAVE will fail because dir doesn't exist; that flips the status metric.
-    redis_cli(pod, "BGSAVE")
-    # Generate change activity so _changes_since_last_save and related
-    # _duration metrics also move off baseline.
-    for i in range(40):
+    # 200 writes with save="" guarantees redis_rdb_changes_since_last_save
+    # exceeds any plausible alert threshold.
+    for i in range(200):
         redis_cli(pod, "SET", "grader:inject:%d" % i, "v%d" % i, timeout=5)
 
 
 def _restore_persistence_config(pod, snapshot):
-    for key in ("dir", "appendonly", "save"):
+    for key in ("appendonly", "save"):
         val = snapshot.get(key, "")
         if val:
             redis_cli(pod, "CONFIG", "SET", key, val)
-    # Trigger a successful BGSAVE so rdb_last_bgsave_status flips back to ok.
+    # Force a save so rdb_changes_since_last_save resets and the agent's
+    # alert (if any) returns to inactive.
     redis_cli(pod, "BGSAVE")
 
 
@@ -349,10 +347,9 @@ def subscore_b_alert_observability():
             b2_detail = "no redis pod to inject failure into"
         else:
             rule_name = rule.get("name", "")
-            fake_dir = "/tmp/grader-inject-" + uuid.uuid4().hex[:8]
             snapshot = _snapshot_persistence_config(pod)
             try:
-                _inject_persistence_failure(pod, fake_dir)
+                _inject_persistence_failure(pod)
                 # Wait scrape (~15s) + eval (~15s) + a margin for state propagation.
                 fired, state = _poll_alert_pending_or_firing(rule_name, timeout=60)
                 b2_ok = fired

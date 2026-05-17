@@ -107,20 +107,22 @@ data = d.setdefault("data", {})
 data["alerts.yml"] = """groups:
 - name: redis.persistence
   rules:
-  - alert: RedisRDBSnapshotFailing
-    expr: redis_rdb_last_bgsave_status != 1
-    for: 5m
+  - alert: RedisAOFDisabled
+    expr: redis_aof_enabled == 0
+    for: 30s
     labels:
       severity: critical
     annotations:
-      summary: "Redis RDB snapshot has been failing for 5+ minutes"
-  - alert: RedisAOFWriteFailing
-    expr: redis_aof_last_write_status != 1
+      summary: "Redis AOF persistence has been disabled"
+      description: "Cache layer is now ephemeral. Any pod restart loses all data."
+  - alert: RedisChangesAccumulatingWithoutSave
+    expr: redis_rdb_changes_since_last_save > 10000
     for: 5m
     labels:
-      severity: critical
+      severity: warning
     annotations:
-      summary: "Redis AOF writes have been failing for 5+ minutes"
+      summary: "Redis has >10K unsaved changes for >5m"
+      description: "Save policy may be disabled or BGSAVE not running."
 """
 
 # Make sure prometheus.yml references the rule file. Uncomment or add rule_files.
