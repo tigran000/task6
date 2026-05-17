@@ -1,22 +1,25 @@
 """Grader for redis-persistence-drift.
 
-Two equal-weight binary subscores:
-  A persistence_survives_restart      (FUNCTIONAL)
+Two equal-weight, binary, orthogonal subscores:
+
+  A persistence_survives_restart  (FUNCTIONAL)
       End-to-end probe: SET a unique key in bleater-redis-0, force RDB+AOF
       flush (polling, not bare sleep), kill the pod, wait for recovery,
-      GET the key. Passes iff the value survived the restart.
+      GET the key. Passes iff the value survived the restart. This implicitly
+      requires CONFIG save/appendonly to be set AND /data to be on a Bound PVC
+      mounted at /data — so the agent's persistence-fix work is fully covered
+      by A's outcome, not by separate structural checks.
 
-  B config_and_observability_combined (NON-FUNCTIONAL AND-gate of 5 items)
-      b1 save_non_empty             — CONFIG GET save is not empty
-      b2 appendonly_yes             — CONFIG GET appendonly == yes
-      b3 pvc_bound                  — PVC backing the live pod's /data is Bound
-      b4 pvc_mounted_at_data        — /data on the live pod is a PVC, not emptyDir
-      b5 alert_rule_present         — Prometheus has an alerting rule (type=alerting,
-                                       health=ok) whose expression references
-                                       redis_rdb_last_bgsave_status or
-                                       redis_aof_last_write_status. Verified via
-                                       live /api/v1/rules (no PrometheusRule CRD
-                                       exists on this snapshot).
+  B alert_rule_present            (OBSERVABILITY)
+      Live Prometheus has an alerting rule (type=alerting, health=ok) whose
+      PromQL expression references one of the redis-exporter persistence
+      metrics. Single check, not AND-gated — by design the only B-item that
+      is independent of A.
+
+Per key-info.md "Subscore Independence Verification", A and B do not share
+underlying state: agent can pass A while failing B (fixes redis, skips
+monitoring) or pass B while failing A (writes the alert rule, doesn't fix
+redis). All four cells of the joint distribution are reachable.
 """
 
 import json
@@ -127,66 +130,7 @@ def subscore_a_persistence_survives_restart():
     return 0, "probe key lost after restart (got %r)" % got
 
 
-def b1_save_set(pod):
-    out = redis_cli(pod, "CONFIG", "GET", "save")
-    lines = out.splitlines()
-    val = lines[1].strip() if len(lines) >= 2 else ""
-    return bool(val) and val != '""', val
-
-
-def b2_aof_on(pod):
-    out = redis_cli(pod, "CONFIG", "GET", "appendonly")
-    lines = out.splitlines()
-    val = lines[1].strip().lower() if len(lines) >= 2 else ""
-    return val == "yes", val
-
-
-def _data_volume_claim_for_current_pod():
-    """Return the PVC name backing /data on the live Redis pod, or None."""
-    pod = redis_pod()
-    if not pod:
-        return None, None
-    _, out, _ = run(KUBECTL + ["get", "pod", pod, "-o", "json"])
-    try:
-        data = json.loads(out)
-    except Exception:
-        return None, None
-    spec = data.get("spec", {})
-    volumes = {v["name"]: v for v in spec.get("volumes", [])}
-    target_volume = None
-    for c in spec.get("containers", []):
-        for m in c.get("volumeMounts", []):
-            if m.get("mountPath") == "/data":
-                target_volume = m.get("name")
-                break
-        if target_volume:
-            break
-    if not target_volume:
-        return None, None
-    vol = volumes.get(target_volume, {})
-    pvc = vol.get("persistentVolumeClaim", {})
-    return pvc.get("claimName"), vol
-
-
-def b3_pvc_bound():
-    """Tied to the PVC actually claimed by the live Redis pod (not any orphan)."""
-    claim_name, _ = _data_volume_claim_for_current_pod()
-    if not claim_name:
-        return False, "current redis pod has no PVC at /data"
-    phase = kubectl_jsonpath(["get", "pvc", claim_name], "{.status.phase}")
-    if phase == "Bound":
-        return True, claim_name + ":Bound"
-    return False, "%s:%s" % (claim_name, phase or "missing")
-
-
-def b4_pvc_mounted_at_data():
-    claim_name, vol = _data_volume_claim_for_current_pod()
-    if claim_name:
-        return True, "/data backed by PVC " + claim_name
-    return False, "/data not backed by PVC (volume=%r)" % (vol or {})
-
-
-def b5_alert_rule_loaded():
+def subscore_b_alert_rule_loaded():
     """Query the live Prometheus /api/v1/rules via kubectl exec into the
     prometheus pod. Match on metric NAME in the rule's expression, not on
     the alert's user-chosen title. No PrometheusRule CRD exists on this
@@ -225,61 +169,26 @@ def b5_alert_rule_loaded():
     return False, "no alerting rule references redis_rdb/aof status metric"
 
 
-def subscore_b_combined():
-    pod = wait_for_redis(timeout=60)
-    if pod:
-        r1, v1 = b1_save_set(pod)
-        r2, v2 = b2_aof_on(pod)
-    else:
-        r1, v1 = False, "no redis pod"
-        r2, v2 = False, "no redis pod"
-    r3, v3 = b3_pvc_bound()
-    r4, v4 = b4_pvc_mounted_at_data()
-    r5, v5 = b5_alert_rule_loaded()
-    items = [
-        ("save_non_empty", r1, v1),
-        ("appendonly_yes", r2, v2),
-        ("pvc_bound", r3, v3),
-        ("pvc_mounted_at_/data", r4, v4),
-        ("alert_rule_present", r5, v5),
-    ]
-    passed = all(ok for _, ok, _ in items)
-    detail_lines = [
-        ("+" if ok else "x") + " " + name + ": " + str(detail)
-        for name, ok, detail in items
-    ]
-    return (1 if passed else 0), "\n".join(detail_lines)
-
-
 def grade(transcript=None):
-    subscores = {}
     weights = {
         "persistence_survives_restart": 0.5,
-        "config_and_observability_combined": 0.5,
+        "alert_rule_present": 0.5,
     }
 
     a_score, a_detail = subscore_a_persistence_survives_restart()
-    subscores["persistence_survives_restart"] = float(a_score)
+    b_pass, b_detail = subscore_b_alert_rule_loaded()
+    b_score = 1 if b_pass else 0
 
-    b_score, b_detail = subscore_b_combined()
-    subscores["config_and_observability_combined"] = float(b_score)
-
+    subscores = {
+        "persistence_survives_restart": float(a_score),
+        "alert_rule_present": float(b_score),
+    }
     total = sum(subscores[k] * weights[k] for k in subscores)
 
-    feedback_lines = []
-    feedback_lines.append(
-        ("+" if a_score else "x")
-        + " persistence_survives_restart: "
-        + a_detail
+    feedback = (
+        ("+" if a_score else "x") + " persistence_survives_restart: " + a_detail + "\n"
+        + ("+" if b_score else "x") + " alert_rule_present: " + b_detail
     )
-    feedback_lines.append(
-        ("+" if b_score else "x")
-        + " config_and_observability_combined:"
-    )
-    for line in b_detail.splitlines():
-        feedback_lines.append("    " + line)
-
-    feedback = "\n".join(feedback_lines)
 
     log("GRADER_FEEDBACK_BEGIN")
     for line in feedback.splitlines():
