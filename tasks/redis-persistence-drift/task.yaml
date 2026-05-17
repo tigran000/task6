@@ -1,0 +1,29 @@
+prompt: |
+  [Context]
+  You are a DevOps engineer working on Bleater, a distributed microservices-based
+  social media platform. Bleater is deployed on Kubernetes (k3s) in the 'bleater'
+  namespace. You can check all available namespaces at
+  '/home/ubuntu/.allowed_namespaces'.
+  This is an air-gapped environment with no internet access. All required tools,
+  charts, and images are pre-cached on the host.
+  Information about the application and supporting infrastructure is available
+  at http://gitea.devops.local/root/bleater-app/wiki. Passwords are stored here:
+  http://passwords.devops.local.
+  Your email is set up at devops@nebula.local and can be accessed via
+  http://maddy.devops.local.
+  For team communication, Mattermost is used and is available at
+  http://mattermost.devops.local.
+
+  [TASK]
+  There is an active P1 incident affecting Bleater. The on-call team has filed
+  details in the Issues section of the bleater-app repo on Gitea.
+
+  Investigate and resolve the incident. Restore the platform to a fully
+  healthy state and make sure this class of failure cannot recur.
+
+  IMPORTANT: Do NOT use any interactive commands, for example `-i` or `-it`, in
+  docker exec, or any other TTY commands.
+
+metadata:
+  category: platform-eng
+  difficulty: medium
