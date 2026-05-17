@@ -133,8 +133,6 @@ if [ "$PHASE" = "Running" ]; then
   done
 fi
 
-kubectl label namespace "$NS" redis-baseline=present --overwrite >/dev/null 2>&1 || true
-
 echo "[setup] Filing P1 incident + decoys in Gitea..."
 GITEA_TOKEN=""
 TOKEN_RESP=$(curl -s -u "${GITEA_USER}:${GITEA_PASS}" \
