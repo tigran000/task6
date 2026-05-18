@@ -6,14 +6,21 @@ between-subscore checks are independent code paths.
 
   A persistence_durability  (weight 0.5)
       a1 baseline_survives_restart
-         STRING key with manual BGSAVE+BGREWRITEAOF, kill pod, GET.
-         Passes if PVC is mounted and either persistence mechanism works.
-      a2 unflushed_probe_survives
-         SET key with NO manual flush. Poll INFO persistence for
-         aof_pending_bio_fsync:0 or rdb_changes_since_last_save:0 so the
-         agent's own save policy / appendfsync is what makes the write
-         durable. Kill pod, GET. Fails if the agent's live config does
-         not actually persist writes between save events.
+         STRING key with manual BGSAVE+BGREWRITEAOF, force-delete the pod,
+         and GET it back. Also asserts /data is on a persistentVolumeClaim
+         (so emptyDir-with-AOF-only does not pass). The grader's force-
+         delete causes the pod to come up with whatever command-args the
+         live sts currently has — so if an sts-patching reverter (e.g.,
+         redis-config-watchdog) is still alive and has flipped the sts
+         to `--appendonly no` and `--save ""`, the new pod loads from
+         RDB but writes after the last BGSAVE are lost on the next cycle.
+      a3 no_unexpected_sidecar_in_bleat_service
+         The bleater-bleat-service Deployment must contain ONLY its
+         legitimate containers — specifically, no `cache-config-tuner`
+         sidecar (the aggressive 5s in-memory CONFIG SET loop installed
+         by setup). Without this check, agents who repaired the sts but
+         missed the sidecar would still appear to pass A, because the
+         sidecar's effect doesn't survive a pod restart (in-memory only).
 
   B alert_observability     (weight 0.5)
       b1 alert_rule_loaded
@@ -29,8 +36,9 @@ between-subscore checks are independent code paths.
          because the injection flips the metric to 0.
 
 A and B do not share state: an agent can pass A while failing B (fixes
-redis, skips monitoring) or pass B while failing A (writes alert, does
-not fix redis). All four cells of the joint distribution are reachable.
+redis + reverters, skips monitoring) or pass B while failing A (writes
+alert, leaves a reverter alive). All four cells of the joint distribution
+are reachable.
 """
 
 import json
@@ -140,74 +148,107 @@ def _data_mount_is_pvc(pod_name):
     return False
 
 
+_BLEAT_SERVICE_FORBIDDEN_SIDECARS = {"cache-config-tuner"}
+
+
+def _bleat_service_container_names():
+    """Return the list of container names currently in the bleater-bleat-service
+    Deployment, or None if the Deployment is unreadable / absent."""
+    _, out, _ = run(
+        KUBECTL + [
+            "get", "deploy", "bleater-bleat-service",
+            "-o", "jsonpath={.spec.template.spec.containers[*].name}",
+        ],
+        timeout=15,
+    )
+    text = (out or "").strip()
+    if not text:
+        return None
+    return text.split()
+
+
 def subscore_a_persistence_durability():
-    """AND-gate of 2 probes, both within ONE pod restart cycle.
-    a1 baseline_survives_restart    — manual BGSAVE+BGREWRITEAOF, kill, GET.
-                                       ALSO asserts /data is on a PVC, so
-                                       emptyDir-with-AOF-only does not pass.
-    a2 unflushed_probe_survives     — write probe, lapse a 2-second timing
-                                       window (no manual flush, no polling
-                                       for redis-internal state), kill, GET.
-                                       With a working appendfsync setting,
-                                       the OS flushes within the window;
-                                       with appendfsync=no the write is
-                                       still in the OS page-cache and is
-                                       lost on force-delete.
+    """AND-gate of 2 independent checks.
+    a1 baseline_survives_restart           — write+BGSAVE+BGREWRITEAOF, force-
+                                              delete the pod, GET back. Also
+                                              asserts /data is on a PVC. The
+                                              new pod boots from the LIVE sts
+                                              spec, so if the sts-patching
+                                              reverter (`redis-config-watchdog`)
+                                              is still alive it will have
+                                              flipped the command to
+                                              `--save "" --appendonly no
+                                              --dir /tmp`. With `--dir /tmp`
+                                              the new pod can no longer find
+                                              the RDB file we BGSAVEd onto
+                                              the `/data` PVC, so the round-
+                                              trip fails. Agents must kill
+                                              the watchdog AND its RBAC for
+                                              this check to pass.
+    a3 no_unexpected_sidecar_in_bleat_service —
+                                              Independent topology check.
+                                              The bleater-bleat-service
+                                              Deployment must not contain a
+                                              `cache-config-tuner` sidecar
+                                              (the camouflaged 5s reverter).
+                                              Catches agents who repaired
+                                              persistence but missed the
+                                              sidecar — the lowest-visibility
+                                              reverter, hidden inside another
+                                              app's container list.
     """
     pod = wait_for_redis(timeout=120)
     if not pod:
         return [0, 0], [
             ("baseline_survives_restart", False, "no redis pre-probe"),
-            ("unflushed_probe_survives", False, "no redis pre-probe"),
+            ("no_unexpected_sidecar_in_bleat_service", False,
+             "redis unavailable; cannot validate cluster state"),
         ]
 
-    # a1: probe key, then force a manual flush via BGSAVE+BGREWRITEAOF.
+    # a1: probe key, then force a manual flush via BGSAVE+BGREWRITEAOF, then
+    # force-delete the pod. On restart the pod uses whatever command-args
+    # the LIVE sts has at that moment — that is the failure mode the
+    # sts-patching reverter (redis-config-watchdog) exploits.
     a1_key = "grader:base:" + uuid.uuid4().hex
     a1_val = uuid.uuid4().hex
     redis_cli(pod, "SET", a1_key, a1_val)
     _poll_bgsave_done(pod, timeout=30)
     _poll_aof_rewrite_done(pod, timeout=15)
 
-    # a2: probe key written AFTER the manual flush. We do NOT call BGSAVE or
-    # BGREWRITEAOF — survival depends on the agent's live appendfsync setting
-    # getting this write through the OS within the 2-second window.
-    a2_key = "grader:noflush:" + uuid.uuid4().hex
-    a2_val = uuid.uuid4().hex
-    redis_cli(pod, "SET", a2_key, a2_val)
-    # 2-second timing window — polling-style loop, not a substitute for
-    # waiting on an event. The window is the test: appendfsync=everysec
-    # flushes within ~1s, appendfsync=always flushes immediately, and
-    # appendfsync=no leaves the write in OS page-cache (default Linux
-    # writeback interval is 30s, well beyond this window).
-    a2_deadline = time.time() + 2.0
-    while time.time() < a2_deadline:
-        time.sleep(0.5)
-
-    # Single force-delete exercises both probes at once.
     run(KUBECTL + ["delete", "pod", pod, "--force", "--grace-period=0"], timeout=60)
 
     new_pod = wait_for_redis(timeout=180)
     if not new_pod:
-        return [0, 0], [
-            ("baseline_survives_restart", False, "redis did not recover"),
-            ("unflushed_probe_survives", False, "redis did not recover"),
-        ]
+        a1_ok = False
+        a1_detail = "redis did not recover after force-delete"
+    else:
+        a1_got = redis_cli(new_pod, "GET", a1_key)
+        a1_value_ok = a1_got == a1_val
+        a1_pvc_ok = _data_mount_is_pvc(new_pod)
+        a1_ok = a1_value_ok and a1_pvc_ok
+        a1_detail = ("round-trip + /data on PVC" if a1_ok else
+                     "value_ok=%s pvc_mount=%s got=%r" % (a1_value_ok, a1_pvc_ok, a1_got))
 
-    a1_got = redis_cli(new_pod, "GET", a1_key)
-    a2_got = redis_cli(new_pod, "GET", a2_key)
+    # a3: topology check on bleater-bleat-service. Independent code path
+    # from a1 — does not depend on Redis at all, only on the Deployment
+    # spec. Reads container names; fails if any forbidden sidecar is still
+    # attached.
+    names = _bleat_service_container_names()
+    if names is None:
+        a3_ok = False
+        a3_detail = ("could not read bleater-bleat-service deployment "
+                     "(missing or inaccessible)")
+    else:
+        bad = [n for n in names if n in _BLEAT_SERVICE_FORBIDDEN_SIDECARS]
+        a3_ok = len(bad) == 0
+        a3_detail = ("no forbidden sidecar attached (containers=%s)" % names
+                     if a3_ok else
+                     "forbidden sidecar(s) still attached: %s (containers=%s)"
+                     % (bad, names))
 
-    a1_value_ok = a1_got == a1_val
-    a1_pvc_ok = _data_mount_is_pvc(new_pod)
-    a1_ok = a1_value_ok and a1_pvc_ok
-    a2_ok = a2_got == a2_val
-
-    a1_detail = ("round-trip + /data on PVC" if a1_ok else
-                 "value_ok=%s pvc_mount=%s got=%r" % (a1_value_ok, a1_pvc_ok, a1_got))
-    a2_detail = ("survived 2s window" if a2_ok else
-                 "value lost (got=%r)" % a2_got)
-    return [int(a1_ok), int(a2_ok)], [
+    return [int(a1_ok), int(a3_ok)], [
         ("baseline_survives_restart", a1_ok, a1_detail),
-        ("unflushed_probe_survives", a2_ok, a2_detail),
+        ("no_unexpected_sidecar_in_bleat_service", a3_ok, a3_detail),
     ]
 
 

@@ -224,12 +224,54 @@ kubectl -n bleater patch deployment bleater-bleat-service --type=json -p='[
 ]' >/dev/null 2>&1 || true
 kubectl -n bleater rollout status deploy/bleater-bleat-service --timeout=90s >/dev/null 2>&1 || true
 
-# Second config-syncer in the monitoring namespace on a different cadence
-# (every 2 minutes). Mimics a SRE/monitoring-team watchdog reasserting
-# "expected" cache config from a config catalog. Cross-namespace placement
-# means agents who only audit `bleater` cronjobs miss this one.
-echo "[setup] Installing redis-config-watchdog CronJob (monitoring namespace)..."
+# Cross-namespace SRE watchdog. Unlike the in-memory CONFIG SET reverters
+# above, this one patches the StatefulSet's command-args directly via the
+# Kubernetes API, so the broken configuration SURVIVES pod restarts (the
+# in-memory CONFIG SETs are overwritten by the sts command-args on every
+# Redis boot — patching the sts itself is the only way to make persistence
+# regress across a force-delete). Needs RBAC (SA in monitoring, Role in
+# bleater granting patch on statefulsets, RoleBinding stitching them).
+echo "[setup] Installing redis-config-watchdog RBAC + CronJob (monitoring namespace, sts-patch)..."
 cat <<'YAML' | kubectl apply -f - >/dev/null 2>&1 || true
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: redis-config-watchdog
+  namespace: monitoring
+  labels:
+    app: redis-config-watchdog
+    app.kubernetes.io/managed-by: monitoring-team
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: redis-config-watchdog
+  namespace: bleater
+  labels:
+    app: redis-config-watchdog
+    app.kubernetes.io/managed-by: monitoring-team
+rules:
+- apiGroups: ["apps"]
+  resources: ["statefulsets"]
+  verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: redis-config-watchdog
+  namespace: bleater
+  labels:
+    app: redis-config-watchdog
+    app.kubernetes.io/managed-by: monitoring-team
+subjects:
+- kind: ServiceAccount
+  name: redis-config-watchdog
+  namespace: monitoring
+roleRef:
+  kind: Role
+  name: redis-config-watchdog
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -239,7 +281,7 @@ metadata:
     app: redis-config-watchdog
     app.kubernetes.io/managed-by: monitoring-team
 spec:
-  schedule: "*/2 * * * *"
+  schedule: "*/1 * * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 1
@@ -248,20 +290,38 @@ spec:
       backoffLimit: 0
       template:
         spec:
+          serviceAccountName: redis-config-watchdog
           restartPolicy: Never
           containers:
           - name: watchdog
-            image: redis:7-alpine
+            image: bitnami/kubectl:1.28
             imagePullPolicy: IfNotPresent
             command:
             - sh
             - -c
             - |
-              redis-cli -h bleater-redis-headless.bleater --connect-timeout 3 \
-                CONFIG SET appendonly no >/dev/null 2>&1 || true
-              redis-cli -h bleater-redis-headless.bleater --connect-timeout 3 \
-                CONFIG SET save "" >/dev/null 2>&1 || true
+              kubectl -n bleater patch statefulset bleater-redis --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/command","value":["redis-server","--save","","--appendonly","no","--dir","/tmp"]}]' >/dev/null 2>&1 || true
 YAML
+
+# Pre-pull bitnami/kubectl:1.28 into k3s's containerd cache so the watchdog
+# CronJob can spawn its pod during the agent's air-gapped session without
+# needing to reach a registry. We trigger the pull via a short-lived Pod
+# and wait for it to Succeed; if it fails, the watchdog degrades gracefully
+# to ImagePullBackOff (no setup crash, just a less-effective reverter).
+echo "[setup] Pre-pulling bitnami/kubectl:1.28 into the node image cache..."
+kubectl -n monitoring run kubectl-prepull \
+  --image=bitnami/kubectl:1.28 --restart=Never --command \
+  -- sh -c "exit 0" >/dev/null 2>&1 || true
+PRE_WAIT=0
+while [ $PRE_WAIT -lt 180 ]; do
+  PRE_PHASE=$(kubectl -n monitoring get pod kubectl-prepull -o jsonpath='{.status.phase}' 2>/dev/null || true)
+  if [ "$PRE_PHASE" = "Succeeded" ] || [ "$PRE_PHASE" = "Failed" ]; then
+    break
+  fi
+  sleep 3
+  PRE_WAIT=$((PRE_WAIT + 3))
+done
+kubectl -n monitoring delete pod kubectl-prepull --ignore-not-found --force --grace-period=0 >/dev/null 2>&1 || true
 
 # Wait for Gitea API to be reachable before attempting token creation.
 # Previous versions skipped this and silently passed an empty token to the
@@ -323,10 +383,9 @@ if [ -n "$GITEA_TOKEN" ]; then
 - Scaled up Postgres read replicas — temporary relief only
 
 ### Notes
-- We have no alerting on this layer at all and got blindsided
-- Please also wire up Prometheus alerts so we get paged if the cache
-  layer persistence guarantees regress again — we want to learn about
-  it from a page, not from user complaints
+- We had no alerting on this layer at all and got blindsided. We need
+  to learn about regressions like this from a page, not from user
+  complaints — please make sure on-call gets notified next time
 - Please make sure whatever caused this cannot recur
 EOF
 )

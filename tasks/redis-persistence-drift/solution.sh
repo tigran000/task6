@@ -17,8 +17,14 @@ echo "[solution] Removing config reverters that re-disable persistence..."
 # Reverter 1 & 2: CronJobs that re-assert appendonly=no on a schedule.
 kubectl -n "$NS" delete cronjob cache-config-syncer --ignore-not-found >/dev/null 2>&1 || true
 kubectl -n "$NS" delete job -l app=cache-config-syncer --ignore-not-found >/dev/null 2>&1 || true
+# redis-config-watchdog now patches the sts via the Kubernetes API (it
+# carries a ServiceAccount with patch rights on bleater statefulsets).
+# Delete the CronJob first, then strip RBAC so nothing else can re-patch.
 kubectl -n monitoring delete cronjob redis-config-watchdog --ignore-not-found >/dev/null 2>&1 || true
 kubectl -n monitoring delete job -l app=redis-config-watchdog --ignore-not-found >/dev/null 2>&1 || true
+kubectl -n "$NS" delete rolebinding redis-config-watchdog --ignore-not-found >/dev/null 2>&1 || true
+kubectl -n "$NS" delete role redis-config-watchdog --ignore-not-found >/dev/null 2>&1 || true
+kubectl -n monitoring delete serviceaccount redis-config-watchdog --ignore-not-found >/dev/null 2>&1 || true
 kubectl -n monitoring delete cronjob redis-fsync-tuner --ignore-not-found >/dev/null 2>&1 || true
 kubectl -n monitoring delete job -l app=redis-fsync-tuner --ignore-not-found >/dev/null 2>&1 || true
 
