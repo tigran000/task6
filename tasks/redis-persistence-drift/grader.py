@@ -296,20 +296,29 @@ def _restore_persistence_config(pod, snapshot):
     redis_cli(pod, "BGSAVE")
 
 
+def _current_alert_state(rule_name):
+    """Return the alert state for this rule name right now, or 'inactive'
+    if no alert instance is present (Prometheus omits inactive rules from
+    /api/v1/alerts)."""
+    data, _ = _prom_query("/api/v1/alerts")
+    if not data:
+        return "unknown"
+    for a in data.get("data", {}).get("alerts", []):
+        labels = a.get("labels") or {}
+        if labels.get("alertname") == rule_name:
+            return a.get("state", "unknown")
+    return "inactive"
+
+
 def _poll_alert_pending_or_firing(rule_name, timeout=60):
     """Poll /api/v1/alerts looking for an alert instance with this rule name
     in pending or firing state. Pending counts as proof-of-life; the rule's
     `for:` clause length therefore does not matter."""
     start = time.time()
     while time.time() - start < timeout:
-        data, _ = _prom_query("/api/v1/alerts")
-        if data:
-            for a in data.get("data", {}).get("alerts", []):
-                labels = a.get("labels") or {}
-                if labels.get("alertname") == rule_name:
-                    state = a.get("state", "")
-                    if state in ("pending", "firing"):
-                        return True, state
+        state = _current_alert_state(rule_name)
+        if state in ("pending", "firing"):
+            return True, state
         time.sleep(3)
     return False, None
 
@@ -324,9 +333,14 @@ def subscore_b_alert_observability():
     b1_detail = ("matched " + (rule.get("name", "?") if rule else "?")
                  + " on metric " + (metric or "?")) if b1_ok else (err or "no rule")
 
-    # b2: BEHAVIORAL — inject synthetic persistence failure, verify the
-    # agent's alert actually responds to it. Catches decorative alerts whose
-    # expression would never fire (e.g., expr: redis_aof_enabled == 1).
+    # b2: BEHAVIORAL — verify the alert TRANSITIONS from inactive to
+    # pending/firing under synthetic injection. Two-sided check:
+    #   1. Pre-injection: alert must be inactive. Always-firing decorative
+    #      alerts (e.g., `expr: redis_aof_enabled < 999`) are already
+    #      firing when redis is healthy → fail this gate.
+    #   2. Post-injection: alert must reach pending/firing within 60s.
+    # An alert that's stuck on or stuck off fails one side. Only an alert
+    # whose expression genuinely flips with the metric passes both.
     if not rule:
         b2_ok = False
         b2_detail = "no rule to test (b1 failed)"
@@ -337,18 +351,27 @@ def subscore_b_alert_observability():
             b2_detail = "no redis pod to inject failure into"
         else:
             rule_name = rule.get("name", "")
-            snapshot = _snapshot_persistence_config(pod)
-            try:
-                _inject_persistence_failure(pod)
-                # Wait for scrape + eval cycles + propagation margin.
-                fired, state = _poll_alert_pending_or_firing(rule_name, timeout=60)
-                b2_ok = fired
-                b2_detail = ("alert %s reached %s" % (rule_name, state)
-                             if fired else
-                             "alert %s did not reach pending/firing within 60s "
-                             "of synthetic failure injection" % rule_name)
-            finally:
-                _restore_persistence_config(pod, snapshot)
+            pre_state = _current_alert_state(rule_name)
+            if pre_state in ("pending", "firing"):
+                b2_ok = False
+                b2_detail = ("alert %s was already %s before injection "
+                             "(decorative / always-fires rule)" %
+                             (rule_name, pre_state))
+            else:
+                snapshot = _snapshot_persistence_config(pod)
+                try:
+                    _inject_persistence_failure(pod)
+                    fired, state = _poll_alert_pending_or_firing(rule_name, timeout=60)
+                    b2_ok = fired
+                    b2_detail = (
+                        ("alert %s transitioned %s -> %s under injection" %
+                         (rule_name, pre_state, state))
+                        if fired else
+                        "alert %s did not transition out of %s within 60s "
+                        "of synthetic failure injection" % (rule_name, pre_state)
+                    )
+                finally:
+                    _restore_persistence_config(pod, snapshot)
 
     return [int(b1_ok), int(b2_ok)], [
         ("alert_rule_loaded", b1_ok, b1_detail),
