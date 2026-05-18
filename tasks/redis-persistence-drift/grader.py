@@ -246,18 +246,24 @@ def _find_matching_alert_rule():
     return None, None, "no alerting rule references a redis-exporter persistence metric"
 
 
-# Narrowed to two metrics that respond reliably to live CONFIG SET changes
-# AND are the right alert family for this incident class. The original
-# breakage was 'save policy disabled, appendonly no' — that doesn't cause
-# BGSAVE failures (no save is attempted at all), so _status metrics would
-# never fire and wouldn't have caught the original incident. The right
-# alerts are on CONFIG STATE, not on failure events:
-#   - redis_aof_enabled               → 0 means AOF was turned off
-#   - redis_rdb_changes_since_last_save > N → save policy isn't snapshotting
-# Both metrics are also reliably flippable via CONFIG SET without needing
-# protected-config workarounds (dir/dbfilename are locked in Redis 7+).
+# Accepted metric families for a "Redis persistence regressed" alert.
+# Two are reliably triggered by the grader's synthetic injection
+# (appendonly no + writes flips aof_enabled and grows rdb_changes_since_
+# last_save), two are not (status metrics only flip when redis actually
+# attempts AND fails a write — the grader can't force those in Redis 7+
+# because dir/dbfilename are protected config). Including the _status
+# metrics anyway, so agents reaching for the canonical "snapshot failing"
+# or "AOF write failing" alerts pass b1 by metric choice. They will then
+# be evaluated by b2 on whether their expression actually fires under
+# the failure the grader can inject — that's a real correctness signal,
+# not a path restriction on metric name.
 _b_metric_pattern = re.compile(
-    r"redis_(aof_enabled|rdb_changes_since_last_save)"
+    r"redis_("
+    r"aof_enabled"
+    r"|rdb_changes_since_last_save"
+    r"|rdb_last_bgsave_status"
+    r"|aof_last_write_status"
+    r")"
 )
 
 
@@ -352,7 +358,14 @@ def subscore_b_alert_observability():
         else:
             rule_name = rule.get("name", "")
             pre_state = _current_alert_state(rule_name)
-            if pre_state in ("pending", "firing"):
+            if pre_state == "unknown":
+                # Sanity-fail rather than vacuously pass. An unknown
+                # pre-state means we couldn't read /api/v1/alerts cleanly,
+                # so the transition gate would be meaningless.
+                b2_ok = False
+                b2_detail = ("could not determine pre-injection alert state "
+                             "(prometheus /api/v1/alerts unavailable)")
+            elif pre_state in ("pending", "firing"):
                 b2_ok = False
                 b2_detail = ("alert %s was already %s before injection "
                              "(decorative / always-fires rule)" %

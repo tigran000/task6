@@ -324,10 +324,9 @@ if [ -n "$GITEA_TOKEN" ]; then
 
 ### Notes
 - We have no alerting on this layer at all and got blindsided
-- Please also wire up Prometheus alerts that page us if the cache layer
-  persistence configuration regresses again — e.g., if AOF gets turned off
-  or if unsaved changes start piling up. We want to learn about it from a
-  page, not from user complaints
+- Please also wire up Prometheus alerts so we get paged if the cache
+  layer persistence guarantees regress again — we want to learn about
+  it from a page, not from user complaints
 - Please make sure whatever caused this cannot recur
 EOF
 )

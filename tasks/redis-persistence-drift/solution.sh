@@ -210,7 +210,7 @@ WAIT=0
 while [ $WAIT -lt 60 ]; do
   RULES_OUT=$(kubectl -n "$PROM_NS" exec deploy/prometheus -- \
     wget -qO- http://localhost:9090/api/v1/rules 2>/dev/null || true)
-  if echo "$RULES_OUT" | grep -q "redis_rdb_last_bgsave_status\|redis_aof_last_write_status"; then
+  if echo "$RULES_OUT" | grep -q "redis_aof_enabled\|redis_rdb_changes_since_last_save"; then
     break
   fi
   sleep 3
@@ -240,7 +240,7 @@ except Exception: pass
 " 2>/dev/null || true)
 
   if [ -n "$ISSUE_NUM" ]; then
-    RCA='## RCA\n\nThe bleater-redis StatefulSet had been re-applied without persistence: `--save \"\" --appendonly no`, and its `/data` mount switched from a PVC to `emptyDir`. The PVC `data-bleater-redis-0` had also been removed. On pod restart Redis came back empty, bleat-service fell through to PostgreSQL for every read, and DB CPU spiked.\n\n## Fix\n- Restored the StatefulSet command to `redis-server --save 3600 1 300 100 60 10000 --appendonly yes --appendfsync everysec --dir /data`.\n- Re-added the `data` `volumeClaimTemplate` (2Gi, RWO) so `/data` is on a Bound PVC again.\n- Added Prometheus alert rules `RedisRDBSnapshotFailing` and `RedisAOFWriteFailing` keyed off `redis_rdb_last_bgsave_status` and `redis_aof_last_write_status`, so we get paged the moment durability regresses again.'
+    RCA='## RCA\n\nThe bleater-redis StatefulSet had been re-applied without persistence: `--save \"\" --appendonly no`, and its `/data` mount switched from a PVC to `emptyDir`. The PVC `data-bleater-redis-0` had also been removed. Several reverter workloads (`cache-config-syncer`, `redis-config-watchdog`, `redis-fsync-tuner`, and a `cache-config-tuner` sidecar inside `bleater-bleat-service`) were also reasserting the broken configuration on a schedule. On pod restart Redis came back empty, bleat-service fell through to PostgreSQL for every read, and DB CPU spiked.\n\n## Fix\n- Removed the reverter CronJobs and the bleat-service sidecar.\n- Restored the StatefulSet command to `redis-server --save 3600 1 300 100 60 10000 --appendonly yes --appendfsync everysec --dir /data`.\n- Re-added the `data` `volumeClaimTemplate` (2Gi, RWO) so `/data` is on a Bound PVC again.\n- Added Prometheus alert rules `RedisAOFDisabled` (on `redis_aof_enabled == 0`) and `RedisChangesAccumulatingWithoutSave` (on `redis_rdb_changes_since_last_save > 10000`), so we get paged the moment durability regresses again.'
     curl -s -o /dev/null --connect-timeout 5 --max-time 15 \
       -X POST -H "Authorization: token ${GITEA_TOKEN}" \
       -H "Content-Type: application/json" \
