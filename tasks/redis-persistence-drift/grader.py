@@ -35,10 +35,17 @@ between-subscore checks are independent code paths.
          A decorative `expr: redis_aof_enabled == 1` would not fire,
          because the injection flips the metric to 0.
 
-A and B do not share state: an agent can pass A while failing B (fixes
-redis + reverters, skips monitoring) or pass B while failing A (writes
-alert, leaves a reverter alive). All four cells of the joint distribution
-are reachable.
+A and B are fully independent. A is measured against the cluster state
+the agent left behind. Before B starts measuring, the grader takes
+temporary control of the persistence layer for the duration of b2's
+measurement window — suspends the reverter CronJobs, scales the
+bleat-service Deployment to 0 (so the cache-config-tuner sidecar pod
+cannot interfere), and patches the sts back to a known-good command —
+then restores the agent's last-set state in a finally block. This means
+the outcome of B depends only on whether the agent built a working
+alert, not on whether they also killed all of A's reverters. All four
+cells of the joint distribution are reachable AND equally likely given
+the agent's actual work.
 """
 
 import json
@@ -370,45 +377,214 @@ def _poll_alert_pending_or_firing(rule_name, timeout=60):
     return False, None
 
 
+# --- B/A isolation: temporary cluster control for b2's measurement window ---
+#
+# Without isolation, B's `b2` is implicitly coupled to A. If an agent fails A
+# by leaving the sts-patching reverter (`redis-config-watchdog`) alive, the
+# live cluster is stuck with `redis_aof_enabled == 0` and any agent alert on
+# that metric is firing pre-injection → b2's "must be inactive" pre-state
+# gate rejects it as decorative → B fails because A failed. The cells
+# {fail A, pass B} and {fail A, fail B} get conflated.
+#
+# To make B's outcome depend only on whether the agent built a real alert,
+# b2 takes temporary control of the persistence-related cluster state for
+# the duration of its measurement window: suspend reverter CronJobs, scale
+# the bleat-service Deployment to 0 (killing the cache-config-tuner sidecar
+# pod), patch the sts back to a known-good command. Everything is restored
+# in a finally block so A's prior measurement is unaffected (A always runs
+# before B) and the cluster ends up in the agent's last-set state.
+
+_REVERTER_CRONJOBS = [
+    ("monitoring", "redis-config-watchdog"),
+    ("monitoring", "redis-fsync-tuner"),
+    ("bleater", "cache-config-syncer"),
+]
+_BLEAT_SERVICE_DEPLOY = "bleater-bleat-service"
+_GOOD_STS_COMMAND = [
+    "redis-server",
+    "--save", "3600 1 300 100 60 10000",
+    "--appendonly", "yes",
+    "--appendfsync", "everysec",
+    "--dir", "/data",
+]
+
+
+def _suspend_reverter_cronjobs():
+    """Patch each known reverter CronJob to spec.suspend=true. Returns the
+    list of (ns, name) we actually changed so caller can restore."""
+    suspended = []
+    for ns, name in _REVERTER_CRONJOBS:
+        rc, _, _ = run(
+            ["kubectl", "-n", ns, "patch", "cronjob", name, "--type=merge",
+             "-p", '{"spec":{"suspend":true}}'],
+            timeout=15,
+        )
+        if rc == 0:
+            suspended.append((ns, name))
+    return suspended
+
+
+def _unsuspend_reverter_cronjobs(suspended):
+    for ns, name in suspended:
+        run(["kubectl", "-n", ns, "patch", "cronjob", name, "--type=merge",
+             "-p", '{"spec":{"suspend":false}}'], timeout=15)
+
+
+def _bleat_service_replicas():
+    out = kubectl_jsonpath(["get", "deploy", _BLEAT_SERVICE_DEPLOY], "{.spec.replicas}")
+    try:
+        return int(out)
+    except Exception:
+        return None
+
+
+def _scale_bleat_service(replicas):
+    run(KUBECTL + ["scale", "deploy", _BLEAT_SERVICE_DEPLOY,
+                    "--replicas=%d" % replicas], timeout=30)
+
+
+def _wait_for_deploy_replicas(deploy, target, timeout=90):
+    start = time.time()
+    while time.time() - start < timeout:
+        out = kubectl_jsonpath(["get", "deploy", deploy], "{.status.replicas}")
+        try:
+            if int(out or "0") == target:
+                return True
+        except Exception:
+            pass
+        time.sleep(3)
+    return False
+
+
+def _snapshot_sts_command():
+    _, out, _ = run(
+        KUBECTL + ["get", "sts", "bleater-redis", "-o",
+                    "jsonpath={.spec.template.spec.containers[0].command}"],
+        timeout=15,
+    )
+    out = (out or "").strip()
+    if not out:
+        return None
+    try:
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def _patch_sts_command(command_args):
+    if not command_args:
+        return
+    patch = json.dumps([{"op": "replace",
+                          "path": "/spec/template/spec/containers/0/command",
+                          "value": command_args}])
+    run(KUBECTL + ["patch", "sts", "bleater-redis",
+                    "--type=json", "-p", patch], timeout=30)
+
+
+def _wait_for_metric_value(metric, target, timeout=90):
+    """Wait for Prometheus to observe `metric` with integer value `target`."""
+    start = time.time()
+    while time.time() - start < timeout:
+        data, _ = _prom_query("/api/v1/query?query=" + metric)
+        if data:
+            for r in (data.get("data", {}).get("result", []) or []):
+                try:
+                    if int(float(r["value"][1])) == target:
+                        return True
+                except Exception:
+                    pass
+        time.sleep(3)
+    return False
+
+
+def _isolate_cluster_for_b2():
+    """Drive the persistence layer to a known-good state for b2's window.
+    Returns a restoration-state dict; pass it to _restore_cluster_after_b2
+    inside a finally block."""
+    state = {
+        "suspended_cronjobs": _suspend_reverter_cronjobs(),
+        "bleat_service_replicas": _bleat_service_replicas(),
+        "sts_command": _snapshot_sts_command(),
+    }
+    # Scale bleat-service to 0 so the cache-config-tuner sidecar pod (if
+    # still attached) cannot keep re-asserting CONFIG SET appendonly no
+    # via redis-cli during our measurement window.
+    if state["bleat_service_replicas"] and state["bleat_service_replicas"] > 0:
+        _scale_bleat_service(0)
+        _wait_for_deploy_replicas(_BLEAT_SERVICE_DEPLOY, 0, timeout=60)
+    # Patch sts to known-good. Retry to absorb the race window where an
+    # already-in-flight reverter Job re-broke the sts after we suspended
+    # its parent CronJob.
+    for _ in range(3):
+        _patch_sts_command(_GOOD_STS_COMMAND)
+        time.sleep(8)
+        cur = _snapshot_sts_command() or []
+        if "--appendonly" in cur and "yes" in cur and "--dir" in cur and "/data" in cur:
+            break
+    # Wait for the new pod the sts-controller is rolling, then wait for
+    # the metric to reach 1 and the alert evaluator to settle.
+    new_pod = wait_for_redis(timeout=180)
+    if not new_pod:
+        return state, None
+    _wait_for_metric_value("redis_aof_enabled", 1, timeout=90)
+    # One rule-eval interval (~15s) past metric stabilization so the alert
+    # state has had a chance to transition to inactive in /api/v1/alerts.
+    time.sleep(20)
+    return state, new_pod
+
+
+def _restore_cluster_after_b2(state):
+    if state is None:
+        return
+    if state.get("sts_command"):
+        _patch_sts_command(state["sts_command"])
+    rep = state.get("bleat_service_replicas")
+    if rep and rep > 0:
+        _scale_bleat_service(rep)
+    _unsuspend_reverter_cronjobs(state.get("suspended_cronjobs") or [])
+
+
 def subscore_b_alert_observability():
-    """AND-gate of 2 checks:
+    """AND-gate of 2 checks, isolated from A so subscore independence holds:
       b1 alert_rule_loaded                  — rule exists with accepted metric.
-      b2 alert_fires_on_synthetic_failure   — behavioral; inject + poll alerts.
+      b2 alert_fires_on_synthetic_failure   — behavioral; inject + poll alerts
+                                              in a controlled cluster state
+                                              (reverters suspended, sidecar
+                                              quiesced, sts patched to known
+                                              good). Restored in finally.
     """
     rule, metric, err = _find_matching_alert_rule()
     b1_ok = rule is not None
     b1_detail = ("matched " + (rule.get("name", "?") if rule else "?")
                  + " on metric " + (metric or "?")) if b1_ok else (err or "no rule")
 
-    # b2: BEHAVIORAL — verify the alert TRANSITIONS from inactive to
-    # pending/firing under synthetic injection. Two-sided check:
-    #   1. Pre-injection: alert must be inactive. Always-firing decorative
-    #      alerts (e.g., `expr: redis_aof_enabled < 999`) are already
-    #      firing when redis is healthy → fail this gate.
-    #   2. Post-injection: alert must reach pending/firing within 60s.
-    # An alert that's stuck on or stuck off fails one side. Only an alert
-    # whose expression genuinely flips with the metric passes both.
-    if not rule:
-        b2_ok = False
-        b2_detail = "no rule to test (b1 failed)"
-    else:
-        pod = redis_pod()
-        if not pod:
+    isolation_state = None
+    try:
+        isolation_state, pod = _isolate_cluster_for_b2()
+
+        # b2: BEHAVIORAL — verify the alert TRANSITIONS from inactive to
+        # pending/firing under synthetic injection, in a known-good cluster.
+        # Pre-state gate catches always-firing decorative alerts; post-
+        # injection poll catches stuck-off alerts. Independent of A because
+        # the isolation reset the cluster persistence state regardless of
+        # how A's reverters were left.
+        if not rule:
             b2_ok = False
-            b2_detail = "no redis pod to inject failure into"
+            b2_detail = "no rule to test (b1 failed)"
+        elif not pod:
+            b2_ok = False
+            b2_detail = ("could not bring redis to known-good state for b2 "
+                         "(isolation setup failed)")
         else:
             rule_name = rule.get("name", "")
             pre_state = _current_alert_state(rule_name)
             if pre_state == "unknown":
-                # Sanity-fail rather than vacuously pass. An unknown
-                # pre-state means we couldn't read /api/v1/alerts cleanly,
-                # so the transition gate would be meaningless.
                 b2_ok = False
                 b2_detail = ("could not determine pre-injection alert state "
                              "(prometheus /api/v1/alerts unavailable)")
             elif pre_state in ("pending", "firing"):
                 b2_ok = False
-                b2_detail = ("alert %s was already %s before injection "
+                b2_detail = ("alert %s was already %s in a known-good cluster "
                              "(decorative / always-fires rule)" %
                              (rule_name, pre_state))
             else:
@@ -426,6 +602,8 @@ def subscore_b_alert_observability():
                     )
                 finally:
                     _restore_persistence_config(pod, snapshot)
+    finally:
+        _restore_cluster_after_b2(isolation_state)
 
     return [int(b1_ok), int(b2_ok)], [
         ("alert_rule_loaded", b1_ok, b1_detail),
