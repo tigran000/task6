@@ -179,6 +179,39 @@ YAML
 # (every 5s) so it reasserts the broken config faster than a CronJob.
 # Find rate is lower than a CronJob (agents rarely audit other apps'
 # container lists) so this mechanism carries A's real variance.
+echo "[setup] Installing redis-fsync-tuner CronJob (bleater namespace)..."
+cat <<'YAML' | kubectl apply -f - >/dev/null 2>&1 || true
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: redis-fsync-tuner
+  namespace: bleater
+  labels:
+    app: redis-fsync-tuner
+    app.kubernetes.io/managed-by: platform-perf
+spec:
+  schedule: "*/2 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: tuner
+            image: redis:7-alpine
+            imagePullPolicy: IfNotPresent
+            command:
+            - sh
+            - -c
+            - |
+              redis-cli -h bleater-redis-headless --connect-timeout 3 \
+                CONFIG SET appendfsync no >/dev/null 2>&1 || true
+YAML
+
 echo "[setup] Installing cache-config-tuner sidecar in bleater-bleat-service..."
 kubectl -n bleater patch deployment bleater-bleat-service --type=json -p='[
   {"op":"add","path":"/spec/template/spec/containers/-","value":{

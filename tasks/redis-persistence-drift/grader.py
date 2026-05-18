@@ -122,28 +122,37 @@ def _poll_aof_rewrite_done(pod, timeout=15):
         time.sleep(1)
 
 
-def _poll_unflushed_durable(pod, timeout=15):
-    """Wait for the agent's live save policy / appendfsync to make recently-
-    written data durable WITHOUT us calling BGSAVE or BGREWRITEAOF. Returns
-    True if at least one of: AOF buffer fsynced (aof_pending_bio_fsync:0) OR
-    save triggered (rdb_changes_since_last_save back to 0)."""
-    start = time.time()
-    while time.time() - start < timeout:
-        info = redis_cli(pod, "INFO", "persistence")
-        if "aof_pending_bio_fsync:0" in info:
-            return True
-        m = re.search(r"^rdb_changes_since_last_save:0\s*$", info, re.M)
-        if m:
-            return True
-        time.sleep(1)
+def _data_mount_is_pvc(pod_name):
+    """Return True if the live pod has /data backed by a persistentVolumeClaim
+    (not emptyDir). Used to gate a1 so that probe-survival via manual flush
+    alone is not enough — durable storage must also be wired."""
+    _, out, _ = run(KUBECTL + ["get", "pod", pod_name, "-o", "json"])
+    try:
+        spec = json.loads(out).get("spec", {})
+    except Exception:
+        return False
+    volumes = {v["name"]: v for v in spec.get("volumes", [])}
+    for c in spec.get("containers", []):
+        for m in c.get("volumeMounts", []):
+            if m.get("mountPath") == "/data":
+                vol = volumes.get(m.get("name"), {})
+                return "persistentVolumeClaim" in vol
     return False
 
 
 def subscore_a_persistence_durability():
     """AND-gate of 2 probes, both within ONE pod restart cycle.
-    a1 baseline_survives_restart   — manual BGSAVE+BGREWRITEAOF, then kill.
-    a2 unflushed_probe_survives    — no manual flush, relies on agent's
-                                     live save policy / appendfsync.
+    a1 baseline_survives_restart    — manual BGSAVE+BGREWRITEAOF, kill, GET.
+                                       ALSO asserts /data is on a PVC, so
+                                       emptyDir-with-AOF-only does not pass.
+    a2 unflushed_probe_survives     — write probe, lapse a 2-second timing
+                                       window (no manual flush, no polling
+                                       for redis-internal state), kill, GET.
+                                       With a working appendfsync setting,
+                                       the OS flushes within the window;
+                                       with appendfsync=no the write is
+                                       still in the OS page-cache and is
+                                       lost on force-delete.
     """
     pod = wait_for_redis(timeout=120)
     if not pod:
@@ -160,12 +169,19 @@ def subscore_a_persistence_durability():
     _poll_aof_rewrite_done(pod, timeout=15)
 
     # a2: probe key written AFTER the manual flush. We do NOT call BGSAVE or
-    # BGREWRITEAOF again — survival depends on the agent's live save policy
-    # and/or appendfsync getting this write to disk before the kill.
+    # BGREWRITEAOF — survival depends on the agent's live appendfsync setting
+    # getting this write through the OS within the 2-second window.
     a2_key = "grader:noflush:" + uuid.uuid4().hex
     a2_val = uuid.uuid4().hex
     redis_cli(pod, "SET", a2_key, a2_val)
-    a2_durable = _poll_unflushed_durable(pod, timeout=15)
+    # 2-second timing window — polling-style loop, not a substitute for
+    # waiting on an event. The window is the test: appendfsync=everysec
+    # flushes within ~1s, appendfsync=always flushes immediately, and
+    # appendfsync=no leaves the write in OS page-cache (default Linux
+    # writeback interval is 30s, well beyond this window).
+    a2_deadline = time.time() + 2.0
+    while time.time() < a2_deadline:
+        time.sleep(0.5)
 
     # Single force-delete exercises both probes at once.
     run(KUBECTL + ["delete", "pod", pod, "--force", "--grace-period=0"], timeout=60)
@@ -180,15 +196,17 @@ def subscore_a_persistence_durability():
     a1_got = redis_cli(new_pod, "GET", a1_key)
     a2_got = redis_cli(new_pod, "GET", a2_key)
 
-    a1_ok = a1_got == a1_val
-    a2_ok = a2_got == a2_val and a2_durable
+    a1_value_ok = a1_got == a1_val
+    a1_pvc_ok = _data_mount_is_pvc(new_pod)
+    a1_ok = a1_value_ok and a1_pvc_ok
+    a2_ok = a2_got == a2_val
 
-    a2_detail = "survived" if a2_ok else (
-        "value lost (durability poll=%s, got=%r)" % (a2_durable, a2_got)
-    )
+    a1_detail = ("round-trip + /data on PVC" if a1_ok else
+                 "value_ok=%s pvc_mount=%s got=%r" % (a1_value_ok, a1_pvc_ok, a1_got))
+    a2_detail = ("survived 2s window" if a2_ok else
+                 "value lost (got=%r)" % a2_got)
     return [int(a1_ok), int(a2_ok)], [
-        ("baseline_survives_restart", a1_ok,
-         "round-trip" if a1_ok else "got=%r" % a1_got),
+        ("baseline_survives_restart", a1_ok, a1_detail),
         ("unflushed_probe_survives", a2_ok, a2_detail),
     ]
 

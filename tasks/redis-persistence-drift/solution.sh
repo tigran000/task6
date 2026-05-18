@@ -19,6 +19,8 @@ kubectl -n "$NS" delete cronjob cache-config-syncer --ignore-not-found >/dev/nul
 kubectl -n "$NS" delete job -l app=cache-config-syncer --ignore-not-found >/dev/null 2>&1 || true
 kubectl -n monitoring delete cronjob redis-config-watchdog --ignore-not-found >/dev/null 2>&1 || true
 kubectl -n monitoring delete job -l app=redis-config-watchdog --ignore-not-found >/dev/null 2>&1 || true
+kubectl -n "$NS" delete cronjob redis-fsync-tuner --ignore-not-found >/dev/null 2>&1 || true
+kubectl -n "$NS" delete job -l app=redis-fsync-tuner --ignore-not-found >/dev/null 2>&1 || true
 
 # Reverter 3: sidecar inside bleater-bleat-service Deployment. Aggressive
 # 5s loop hits redis via the headless service. Has to go before we restart
