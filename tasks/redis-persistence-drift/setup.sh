@@ -211,14 +211,45 @@ spec:
                 CONFIG SET save "" >/dev/null 2>&1 || true
 YAML
 
+# Wait for Gitea API to be reachable before attempting token creation.
+# Previous versions skipped this and silently passed an empty token to the
+# issue-creation block — agents then saw an empty issues list and never
+# encountered the monitoring hint.
+echo "[setup] Waiting for Gitea API at ${GITEA_URL}..."
+GITEA_WAIT=0
+while [ $GITEA_WAIT -lt 300 ]; do
+  GITEA_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    --connect-timeout 3 --max-time 5 \
+    "${GITEA_URL}/api/v1/version" 2>/dev/null || echo "000")
+  if [ "$GITEA_CODE" = "200" ]; then
+    echo "[setup] Gitea API ready (HTTP 200)"
+    break
+  fi
+  sleep 5
+  GITEA_WAIT=$((GITEA_WAIT + 5))
+done
+if [ "$GITEA_CODE" != "200" ]; then
+  echo "ERROR: Gitea API not ready after 300s (last code: ${GITEA_CODE})"
+  exit 1
+fi
+
 echo "[setup] Filing P1 incident + decoys in Gitea..."
-GITEA_TOKEN=""
+# Token creation: NOT silenced — we want a hard failure with a visible error
+# if Gitea rejects the auth, instead of falling through with an empty token.
 TOKEN_RESP=$(curl -s -u "${GITEA_USER}:${GITEA_PASS}" \
   --connect-timeout 5 --max-time 15 \
   -H "Content-Type: application/json" \
   -d '{"name":"setup-bootstrap-'"$RANDOM"'","scopes":["write:repository","write:user","write:admin"]}' \
-  "${GITEA_URL}/api/v1/users/${GITEA_USER}/tokens" 2>/dev/null || true)
+  "${GITEA_URL}/api/v1/users/${GITEA_USER}/tokens") \
+  || { echo "ERROR: gitea token-create curl failed"; exit 1; }
 GITEA_TOKEN=$(echo "$TOKEN_RESP" | grep -o '"sha1":"[^"]*"' | head -n1 | cut -d'"' -f4)
+
+if [ -z "$GITEA_TOKEN" ]; then
+  echo "ERROR: Gitea token creation returned no sha1. Response was:"
+  echo "$TOKEN_RESP"
+  exit 1
+fi
+echo "[setup] Got Gitea token (len ${#GITEA_TOKEN})"
 
 if [ -n "$GITEA_TOKEN" ]; then
   P1_BODY=$(cat <<'EOF'
