@@ -162,24 +162,22 @@ data["alerts.yml"] = """groups:
       description: "Save policy may be disabled or BGSAVE not running."
 """
 
-# Make sure prometheus.yml references the rule file. Uncomment or add rule_files.
-py = data.get("prometheus.yml", "")
-if re.search(r"^rule_files:\s*\n\s*-\s*['\"]?/etc/prometheus/alerts\.yml", py, re.M):
-    pass
-elif re.search(r"^\s*#\s*-\s*\"alerts\.yml\"", py, re.M):
-    py = re.sub(r"^\s*#\s*-\s*\"alerts\.yml\"", "  - /etc/prometheus/alerts.yml", py, flags=re.M)
-elif re.search(r"^rule_files:", py, re.M):
-    py = re.sub(
-        r"^(rule_files:\s*\n)",
-        r"\1  - /etc/prometheus/alerts.yml\n",
-        py,
-        count=1,
-        flags=re.M,
-    )
-else:
-    py = "rule_files:\n  - /etc/prometheus/alerts.yml\n\n" + py
-
-data["prometheus.yml"] = py
+# Parse prometheus.yml as YAML and set rule_files cleanly. Regex-based
+# string surgery on the previous version of this script could leave the
+# config in a state where Prometheus silently loaded the old (rules-less)
+# config — the rule file landed in the ConfigMap but rule_files: never
+# pointed at it.
+py_text = data.get("prometheus.yml", "")
+try:
+    py_doc = yaml.safe_load(py_text) or {}
+except Exception:
+    py_doc = {}
+rule_files = py_doc.get("rule_files") or []
+target = "/etc/prometheus/alerts.yml"
+if target not in rule_files:
+    rule_files.append(target)
+py_doc["rule_files"] = rule_files
+data["prometheus.yml"] = yaml.safe_dump(py_doc, default_flow_style=False, sort_keys=False)
 open(dst, "w").write(yaml.safe_dump(d))
 PY
 
@@ -205,17 +203,67 @@ while [ $WAIT -lt 90 ]; do
   WAIT=$((WAIT + 3))
 done
 
-# Wait for Prometheus to load the new rules.
+# Wait for Prometheus to load the new rules AND evaluate them to health=ok.
+# Just-loaded rules have health=unknown for ~one eval_interval (~15s); the
+# grader rejects anything not in (None, "ok"), so we need to wait past the
+# first evaluation, not just for the rule to appear in /api/v1/rules.
 WAIT=0
-while [ $WAIT -lt 60 ]; do
+RULES_LOADED=no
+while [ $WAIT -lt 180 ]; do
   RULES_OUT=$(kubectl -n "$PROM_NS" exec deploy/prometheus -- \
     wget -qO- http://localhost:9090/api/v1/rules 2>/dev/null || true)
-  if echo "$RULES_OUT" | grep -q "redis_aof_enabled\|redis_rdb_changes_since_last_save"; then
+  HEALTH=$(echo "$RULES_OUT" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    for g in d.get('data', {}).get('groups', []):
+        for r in g.get('rules', []):
+            expr = r.get('query', '') or r.get('expr', '')
+            if 'redis_aof_enabled' in expr or 'redis_rdb_changes_since_last_save' in expr:
+                if r.get('health') in (None, 'ok'):
+                    print('ok'); sys.exit(0)
+except Exception:
+    pass
+print('not_ok')
+" 2>/dev/null || echo "not_ok")
+  if [ "$HEALTH" = "ok" ]; then
+    RULES_LOADED=yes
     break
   fi
   sleep 3
   WAIT=$((WAIT + 3))
 done
+
+# Last-resort fallback: if Prometheus still hasn't picked up the rule
+# (e.g., kubelet hasn't synced the ConfigMap mount), force a fresh pod.
+# This sometimes recovers from "old pod sees old CM volume" race.
+if [ "$RULES_LOADED" != "yes" ]; then
+  echo "[solution] Rule not loaded after 180s; forcing prometheus pod restart..."
+  kubectl -n "$PROM_NS" delete pod -l app=prometheus --force --grace-period=0 >/dev/null 2>&1 || true
+  WAIT=0
+  while [ $WAIT -lt 90 ]; do
+    READY=$(kubectl -n "$PROM_NS" get pod -l app=prometheus -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null || true)
+    [ "$READY" = "true" ] && break
+    sleep 3
+    WAIT=$((WAIT + 3))
+  done
+  WAIT=0
+  while [ $WAIT -lt 60 ]; do
+    RULES_OUT=$(kubectl -n "$PROM_NS" exec deploy/prometheus -- \
+      wget -qO- http://localhost:9090/api/v1/rules 2>/dev/null || true)
+    if echo "$RULES_OUT" | grep -q "redis_aof_enabled\|redis_rdb_changes_since_last_save"; then
+      echo "[solution] Rule loaded after forced restart."
+      RULES_LOADED=yes
+      break
+    fi
+    sleep 3
+    WAIT=$((WAIT + 3))
+  done
+fi
+
+if [ "$RULES_LOADED" != "yes" ]; then
+  echo "[solution] WARNING: rule still not in /api/v1/rules after fallback restart."
+fi
 
 echo "[solution] Closing the P1 incident with an RCA comment..."
 TOKEN_RESP=$(curl -s -u "${GITEA_USER}:${GITEA_PASS}" \
