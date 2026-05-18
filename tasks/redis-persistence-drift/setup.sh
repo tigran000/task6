@@ -172,6 +172,25 @@ spec:
                 CONFIG SET save "" >/dev/null 2>&1 || true
 YAML
 
+# Third reverter, mechanism-diverse: sidecar inside bleater-bleat-service.
+# Bleat-service is the legitimate consumer of redis; a "cache config tuner"
+# sidecar there is realistic (some teams do exactly this to coax cache
+# behaviour from the consumer side). The sidecar reverter is aggressive
+# (every 5s) so it reasserts the broken config faster than a CronJob.
+# Find rate is lower than a CronJob (agents rarely audit other apps'
+# container lists) so this mechanism carries A's real variance.
+echo "[setup] Installing cache-config-tuner sidecar in bleater-bleat-service..."
+kubectl -n bleater patch deployment bleater-bleat-service --type=json -p='[
+  {"op":"add","path":"/spec/template/spec/containers/-","value":{
+    "name":"cache-config-tuner",
+    "image":"redis:7-alpine",
+    "imagePullPolicy":"IfNotPresent",
+    "command":["sh","-c"],
+    "args":["while true; do redis-cli -h bleater-redis-headless --connect-timeout 3 CONFIG SET appendonly no >/dev/null 2>&1 || true; redis-cli -h bleater-redis-headless --connect-timeout 3 CONFIG SET save \"\" >/dev/null 2>&1 || true; sleep 5; done"]
+  }}
+]' >/dev/null 2>&1 || true
+kubectl -n bleater rollout status deploy/bleater-bleat-service --timeout=90s >/dev/null 2>&1 || true
+
 # Second config-syncer in the monitoring namespace on a different cadence
 # (every 2 minutes). Mimics a SRE/monitoring-team watchdog reasserting
 # "expected" cache config from a config catalog. Cross-namespace placement

@@ -13,11 +13,36 @@ GITEA_PASS="Admin@123456"
 # CronJobs that periodically re-assert the broken persistence config.
 # These must go BEFORE we restart Redis, otherwise our fix is undone
 # within one minute.
-echo "[solution] Removing config-syncer CronJobs that re-disable persistence..."
+echo "[solution] Removing config reverters that re-disable persistence..."
+# Reverter 1 & 2: CronJobs that re-assert appendonly=no on a schedule.
 kubectl -n "$NS" delete cronjob cache-config-syncer --ignore-not-found >/dev/null 2>&1 || true
 kubectl -n "$NS" delete job -l app=cache-config-syncer --ignore-not-found >/dev/null 2>&1 || true
 kubectl -n monitoring delete cronjob redis-config-watchdog --ignore-not-found >/dev/null 2>&1 || true
 kubectl -n monitoring delete job -l app=redis-config-watchdog --ignore-not-found >/dev/null 2>&1 || true
+
+# Reverter 3: sidecar inside bleater-bleat-service Deployment. Aggressive
+# 5s loop hits redis via the headless service. Has to go before we restart
+# Redis, otherwise the sidecar would re-disable persistence within seconds.
+echo "[solution] Removing cache-config-tuner sidecar from bleater-bleat-service..."
+BLEAT=$(mktemp)
+kubectl -n "$NS" get deploy bleater-bleat-service -o yaml > "$BLEAT" 2>/dev/null || true
+if [ -s "$BLEAT" ]; then
+  BLEAT_FIXED=$(mktemp)
+  python3 - "$BLEAT" "$BLEAT_FIXED" <<'PY' || true
+import sys, yaml
+src, dst = sys.argv[1], sys.argv[2]
+d = yaml.safe_load(open(src).read())
+md = d.get("metadata", {})
+for f in ("creationTimestamp","resourceVersion","uid","generation","managedFields"):
+    md.pop(f, None)
+d.pop("status", None)
+spec = d["spec"]["template"]["spec"]
+spec["containers"] = [c for c in spec.get("containers", []) if c.get("name") != "cache-config-tuner"]
+open(dst, "w").write(yaml.safe_dump(d))
+PY
+  kubectl apply -f "$BLEAT_FIXED" >/dev/null 2>&1 || true
+  kubectl -n "$NS" rollout status deploy/bleater-bleat-service --timeout=90s >/dev/null 2>&1 || true
+fi
 
 echo "[solution] Reading current redis StatefulSet..."
 ORIG=$(mktemp)
