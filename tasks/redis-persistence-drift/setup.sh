@@ -236,10 +236,13 @@ fi
 echo "[setup] Filing P1 incident + decoys in Gitea..."
 # Token creation: NOT silenced — we want a hard failure with a visible error
 # if Gitea rejects the auth, instead of falling through with an empty token.
+# Scopes MUST include write:issue — write:repository alone does NOT grant
+# issue creation. Without write:issue, all issue POSTs return 403 and the
+# setup completes "successfully" but agents see open_issues_count: 0.
 TOKEN_RESP=$(curl -s -u "${GITEA_USER}:${GITEA_PASS}" \
   --connect-timeout 5 --max-time 15 \
   -H "Content-Type: application/json" \
-  -d '{"name":"setup-bootstrap-'"$RANDOM"'","scopes":["write:repository","write:user","write:admin"]}' \
+  -d '{"name":"setup-bootstrap-'"$RANDOM"'","scopes":["write:repository","write:user","write:admin","write:issue"]}' \
   "${GITEA_URL}/api/v1/users/${GITEA_USER}/tokens") \
   || { echo "ERROR: gitea token-create curl failed"; exit 1; }
 GITEA_TOKEN=$(echo "$TOKEN_RESP" | grep -o '"sha1":"[^"]*"' | head -n1 | cut -d'"' -f4)
@@ -277,12 +280,22 @@ if [ -n "$GITEA_TOKEN" ]; then
 EOF
 )
   P1_JSON=$(python3 -c "import json,sys; print(json.dumps({'title':'P1 — Bleater feed loading slowly, DB CPU pegged','body':sys.stdin.read()}))" <<<"$P1_BODY")
-  curl -s -o /dev/null --connect-timeout 5 --max-time 15 \
+  # P1 issue: NOT silenced. We need this issue to land — it carries the
+  # monitoring hint. Fail loudly if the POST is rejected.
+  P1_HTTP=$(curl -s -o /tmp/setup-p1-resp -w "%{http_code}" \
+    --connect-timeout 5 --max-time 15 \
     -X POST -H "Authorization: token ${GITEA_TOKEN}" \
     -H "Content-Type: application/json" \
     -d "$P1_JSON" \
-    "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-app/issues" || true
+    "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-app/issues")
+  if [ "$P1_HTTP" != "201" ]; then
+    echo "ERROR: P1 issue POST returned HTTP ${P1_HTTP}. Body:"
+    cat /tmp/setup-p1-resp
+    exit 1
+  fi
+  echo "[setup] P1 issue filed (HTTP 201)"
 
+  # Decoys: silent fallback OK — they're noise, not load-bearing.
   curl -s -o /dev/null --connect-timeout 5 --max-time 15 \
     -X POST -H "Authorization: token ${GITEA_TOKEN}" \
     -H "Content-Type: application/json" \
