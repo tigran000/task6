@@ -1,145 +1,146 @@
 # HANDOFF — redis-persistence-drift
 
-**Last updated:** 2026-05-18 (post-v13-rollout-pull)
+**Last updated:** 2026-05-19 (post-v22 push)
 
 ## TL;DR
 
-13 versions in, mean stuck at exactly **0.50** across every batch (v3, v7, v11, v13). A=DEAD@1 always, B=DEAD@0 always. Mean = 0.5×1.0 + 0.5×0.0 = 0.50, sitting on the strict 0.50 ceiling boundary. **My v8-v13 "fixes" did not move the needle because (a) Gitea hint never reached agents in any version and (b) persistence-survival is at biggie-max-nebula capability ceiling.** Next moves must address those two root causes, not iterate on the grader structure further.
+22 versions in. v20 batch landed mean **0.90** with A=DEAD@1 (5/5)
+and B=4/5 — first batch with any B variance, confirming the v14+
+Gitea hint-delivery fixes finally worked. **0.90 is way over the
+0.50 strict ceiling**: A still saturates because the existing
+reverters only flip in-memory CONFIG, which the sts command-args
+overwrite on pod restart. v22 addresses this by making one reverter
+patch the sts itself.
 
 ## Where things stand
 
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** v13
+- **Current version:** v22 (pushed 2026-05-19, no rollouts yet)
 - **VM:** `tigranharutyunyan59@34.186.153.63`, files at `~/tasks/redis-persistence-drift/`
 - **Local repo:** `/Users/tigran/task6`, GitHub `tigran000/task6`, master branch
 
-## Version history
+## Version history (recent)
 
 | Version | Hypothesis | Outcome |
 |---|---|---|
-| v3 | Initial 2-subscore single-check shape | **5/5 mean=0.50**, A=DEAD@1, B=DEAD@0 |
-| v4 | Monitoring hint in P1 issue body | unevaled |
-| v5 | Soften hint + broaden b5 metrics | unevaled |
-| v6 | Orthogonal subscores | unevaled |
-| v7 | Remove dead `redis-baseline=present` label | **5/5 mean=0.50** (same pattern) |
-| v8 | Fix Gitea URL `:3000` + broaden b5 regex | unevaled |
-| v9 | 3-check AND-gates per subscore | **0/5 success** (infra failure, no scores) |
-| v10 | Behavioral b2 | unevaled |
-| v11 | Narrow b1 to 2 metrics + simpler injection | **5/5 mean=0.50** (same pattern) |
-| v12 | Single CronJob reverter | unevaled |
-| v13 | Scrub design refs + drop a2/b3 + 2nd cross-ns reverter | **4/5 mean=0.50** (same pattern) |
+| v3–v13 | Various — all blocked by Gitea hint not landing | DEAD@1/DEAD@0, mean=0.50 |
+| v14 | Fix Gitea URL `:3000` + `write:issue` scope + HTTP 201 assert | (unevaled, rolled into v15) |
+| v15 | Above + sidecar reverter mech-diversity | 0.70 mean — first B variance |
+| v16–v19 | Reverter calibration + b2 state-transition gate | iterative |
+| v20 | Soften hint + widen b1 metric regex | **0.90 mean** (A 5/5, B 4/5) |
+| v21 | Solution.sh: wait for rule `health=ok` not just loaded | (oracle-stability only; same shape) |
+| v22 | sts-patching reverter + a3 sidecar-check + softer hint | **(pending)** |
 
-## Rollout breakdown (most recent versions)
+## Critical findings
 
-### v13 per-item (4 scored runs)
-```
-baseline_survives_restart:     4/4 ++++   ← A's a1
-unflushed_probe_survives:      4/4 ++++   ← A's a2 (reverter didn't bite)
-alert_rule_loaded:             0/4 xxxx   ← B's b1 (agents not writing matching alerts)
-alert_fires_on_synthetic_failure: 0/4 xxxx ← B's b2 (gated on b1)
-```
+### A's DEAD@1 root cause (v3–v20)
 
-### v11 per-item (5 runs, old 3-check structure)
-```
-string_survives_restart:   5/5 +++++
-hash_survives_restart:     5/5 +++++
-unflushed_probe_survives:  5/5 +++++
-alert_rule_loaded:         0/5 xxxxx
-alert_fires_on_synthetic_failure: 0/5 xxxxx
-alert_is_actionable:       0/5 xxxxx
-```
+All earlier reverters used `redis-cli CONFIG SET appendonly no`,
+which is **in-memory only**. On every pod restart, redis re-reads
+its command-args from the sts spec — if those say `--appendonly yes`,
+the in-memory CONFIG SET is silently overridden at boot. Agents who
+fix the sts but leave reverters alive still pass A's behavioral
+probes (BGSAVE→force-delete→GET) because the new pod boots clean
+with persistence on.
 
-## Critical findings from v13 transcripts
+### B's DEAD@0 root cause (v3–v13, FIXED v14+)
 
-### B's DEAD@0 root cause: Gitea hint NEVER REACHED AGENTS
-Transcript grep across all 5 v13 runs:
+setup.sh's Gitea P1 issue silently failed (token had no `write:issue`
+scope; URL omitted `:3000`). 0/5 transcripts in v13 showed agents
+seeing the P1 body. Fix: explicit `write:issue` scope, port-qualified
+URL, fail-loud `assert HTTP 201`, plus a 300s wait for `/api/v1/version`.
+After v14, the Gitea hint landed in every transcript → B started
+varying in v15.
+
+### v20 batch reality (5 rollouts)
+
 ```
-P1 text seen by agent:      0/5 runs
-Gitea issues API queries:   2-9 per run (agents WERE looking)
-Monitoring hint seen:       0/5 runs
+persistence_durability:           5/5 +++++   ← DEAD@1, no signal
+  a1 baseline_survives_restart:   5/5 +++++
+  a2 unflushed_probe_survives:    5/5 +++++   (everysec is default!)
+alert_observability:              4/5 ++++x
+  b1 alert_rule_loaded:           4/5 ++++x
+  b2 alert_fires_on_synthetic_failure: 4/5 ++++x
 ```
 
-**The v8 "fix" of `GITEA_URL=http://gitea.devops.local:3000` is unverified and apparently broken in hosted env.** Every "hint calibration" iteration since v4 has been against a hint that never landed. All evidence consistent with: setup.sh's Gitea issue-filing block silently fails in hosted eval, agents see `open_issues_count: 0` on `bleater-app`.
+Run5 alone failed — it wrote Grafana-provisioned alerts instead of
+Prometheus rules. Mean = 0.5 + 0.5·0.8 = 0.90.
 
-**Untested locally.** I tested on `apex_rs` (review container) and observed setup.sh's `"Filing P1 incident..."` log but never confirmed the issue actually appeared via API call afterward.
+## v22 hypothesis (active)
 
-### A's DEAD@1 root cause: capability ceiling on persistence-survival axis
-Per `task-hardner.md` decision tree: "Saturated across 5+ test variants of the same axis → Capability ceiling. Drop the axis or grade end-state instead of behavior."
+Pulled from `task-hardner.md` decision tree + bank Pattern 1
+(measured 40-60% find rate for layered self-healing reverters).
 
-My a1/a2/a3 variants (v9, v11, v13) all saturate at 4-5/5 because:
-- Fixing persistence is the *visible primary task* — every capable agent does it
-- The v12/v13 reverter is structurally inert: it only flips IN-MEMORY CONFIG via `CONFIG SET`, which the StatefulSet's `--appendonly yes` command-args overrides on every pod restart
-- Adding more "data survives" variants is exactly the anti-pattern the bank warns against (Anti-pattern #35 test-variant saturation)
+**Change 1 — Restart-persistent reverter.** Existing `redis-config-
+watchdog` CronJob in monitoring switched from `redis:7-alpine` +
+in-memory `CONFIG SET` to `bitnami/kubectl:1.28` + `kubectl patch sts`.
+Patches command-args to `--save "" --appendonly no --dir /tmp` so
+that even after a force-delete the new pod can't find the RDB file
+on `/data` (it's looking at `/tmp`). Requires SA in monitoring + Role
+in bleater + RoleBinding. Image pre-pulled into the node cache via a
+short-lived Pod so the cron-spawned pod has it under air-gap.
 
-## Current grader shape (v13)
+**Change 2 — a2 → a3.** Old a2 (`unflushed_probe_survives`) was a
+default-everysec freebie — every passing agent got it for free.
+Replaced with a3 (`no_unexpected_sidecar_in_bleat_service`): reads
+`kubectl get deploy bleater-bleat-service -o jsonpath=
+{.spec.template.spec.containers[*].name}` and asserts the
+`cache-config-tuner` sidecar is absent. Independent topology check
+that catches agents who repaired persistence but missed the lowest-
+visibility reverter.
 
-Two subscores, equal weight 0.5/0.5, each AND-gate of 2:
+**Change 3 — Softer hint.** Removed the literal word "Prometheus"
+from the P1 body. Agents must now derive Prometheus from the
+cluster's existing monitoring stack, not from the issue text.
+Risk: B could over-correct toward 0%. Mitigation: revert this one
+change in v23 if so.
 
-| Subscore | Check | Type |
-|---|---|---|
-| A `persistence_durability` | a1 baseline_survives_restart | behavioral E2E probe |
-| | a2 unflushed_probe_survives | behavioral, tests live save/appendfsync |
-| B `alert_observability` | b1 alert_rule_loaded | structural |
-| | b2 alert_fires_on_synthetic_failure | behavioral, injection |
+**Expected mean:** 0.5·(A pass rate) + 0.5·(B pass rate). With A
+targeted at 50-70% (kill the watchdog + kill the sidecar + fix sts)
+and B at 50-70% (correct stack choice), mean lands ~0.25-0.35.
 
-## Active reverters (v13)
+## Active reverters (v22)
 
-| Reverter | Namespace | Schedule | Status |
-|---|---|---|---|
-| `cache-config-syncer` CronJob | bleater | every 1m | **structurally inert** — only flips in-memory CONFIG |
-| `redis-config-watchdog` CronJob | monitoring | every 2m | same |
+| # | Reverter | Namespace | Mechanism | Bites |
+|---|---|---|---|---|
+| 1 | `cache-config-syncer` CronJob | bleater | redis-cli CONFIG SET (in-memory) | Nothing (sts overrides on restart) |
+| 2 | `redis-config-watchdog` CronJob | monitoring | **kubectl patch sts (restart-persistent)** | a1 — sts command-args flip → new pod can't load RDB |
+| 3 | `redis-fsync-tuner` CronJob | monitoring | redis-cli CONFIG SET appendfsync (in-memory) | Nothing (sts overrides) |
+| 4 | `cache-config-tuner` sidecar | bleater (in bleat-service Deployment) | redis-cli CONFIG SET (5s loop, in-memory) | a3 — must remove sidecar from Deployment spec |
 
-Both run `redis-cli -h bleater-redis-headless CONFIG SET appendonly no; CONFIG SET save ""`. After ANY pod restart (including grader's a2 force-delete), StatefulSet command args reassert `--appendonly yes` → reverter's effect is gone. **They don't actually bite a2.** Empirically confirmed by v13 a2: 4/4 pass.
-
-## What v14 must address (root causes, not symptoms)
-
-### Priority 1: Verify Gitea hint reaches agents (CHEAP, no eval cost)
-Spin a fresh `horizon setup` container, run setup.sh, then:
-```
-docker exec <container> curl -s http://gitea.devops.local:3000/api/v1/repos/root/bleater-app/issues
-```
-- If response shows the P1 issue → setup.sh works, my v11 hint just isn't converting. Then the calibration problem is real and tune the hint.
-- If response shows `[]` → setup.sh's issue-filing block is broken. Debug WHY (token auth? endpoint? network namespace?). Possible fixes: use `bleater-app/issues` directly without token, or use a different delivery channel (`/home/ubuntu/INCIDENT.md`, wiki page).
-
-### Priority 2: Redesign A's axis OR redesign the reverter
-**Per `task-hardner.md` decision tree on capability ceiling: DROP the axis or grade end-state.**
-- Option A: Accept A=DEAD@1, focus all variance on B. Mean = 0.5 + 0.5·B = 0.5 to 1.0. Even B at 0% leaves us at-ceiling. Not viable for approval.
-- Option B: Redesign reverter to actually bite. Per `key-info.md` "Behavioral Test Patterns" → "reverter removed (restart-triggered)": modify the StatefulSet command-args directly, not just in-memory CONFIG. Reverter would `kubectl patch sts bleater-redis` to flip `--appendonly yes` → `--appendonly no` in command args. Persists across pod restarts. Restart-triggered reverter pattern from bank.
-- Option C: Move A's axis entirely. e.g., A becomes "ArgoCD bleater-platform Application is Synced+Healthy" (orthogonal to persistence-fix). v3-v7 transcripts showed 4-5/5 agents DO re-enable selfHeal, so this might also DEAD@1.
-
-### Priority 3: HANDOFF.md discipline
-This file (per playbook #30). Update on every push going forward.
-
-## What NOT to do for v14
-
-- Don't iterate on grader check structure further. Adding/removing AND-gate items hasn't moved the needle in 13 versions and won't.
-- Don't tune the hint wording further until we confirm it reaches agents.
-- Don't push another version without testing the hypothesis being measured.
+Reverters 1 + 3 are decoys / mechanism-diversity surface area.
+Reverters 2 + 4 carry actual variance.
 
 ## Workflow conventions (durable preferences)
 
-- **No local validation** before push (`[[no-local-validation]]` memory). Hosted eval rollouts are the signal.
-- **Git workflow**: per-version commits in `/Users/tigran/task6` (master). Rsync local → push from VM → commit locally.
-- **Per-version sequence:** edit local → `rsync --exclude='.horizon' --exclude='.rollouts' local → VM` → `horizon tasks push --label "v<N>: ..."` → rsync `.horizon/metadata.json` back → `git add tasks/redis-persistence-drift/<changed> && git commit`
-- **Pull rollouts** with `horizon rollouts pull` from `~/tasks/redis-persistence-drift/` on VM, then rsync `.rollouts/` back to local (gitignored).
-- **Per-item analysis** snippet in `~/Downloads/core/key-info.md` §"Reading Rollout Data Fast".
-- **API keys** in `~/Downloads/core/key-info.md`. mini-batch for new task = `99a0adf0-…` (per `[[horizon-creator-mini-batch]]` memory).
-
-## Files (no new files in v13)
-
-- `Dockerfile` — `nebula-devops:1.1.0`, ALLOWED_NAMESPACES=`bleater,monitoring,argocd,gitea`
-- `task.yaml` — Goldilocks prompt, air-gap notice present, terse "[TASK] Investigate and resolve" framing
-- `setup.sh` — disables ArgoCD auto-sync, replaces sts with broken command + emptyDir, deletes orphan PVC, plants 2 reverters, files P1 + 2 decoys in Gitea, prewarms decoy keys
-- `solution.sh` — kills both reverters, restores sts with PVC, scale 0→1 Prometheus, edits `prometheus-config` ConfigMap to add `alerts.yml` + `rule_files`, closes Gitea issue with RCA
-- `grader.py` — 2 subscores × 2 AND-gated checks each (4 total)
-- `.horizon/metadata.json` — task_id + current version
+- **No local validation** before push (`[[no-local-validation]]` memory).
+  Hosted eval rollouts are the signal.
+- **No eval submissions without explicit user ask.** Pushing a new
+  version is a separate action from submitting a batch.
+- **Git workflow:** per-version commits in `/Users/tigran/task6`
+  (master). Rsync local → push from VM → commit locally.
+- **Per-version sequence:** edit local → `rsync --exclude='.horizon'
+  --exclude='.rollouts' local → VM` → `horizon tasks push --label
+  "v<N>: ..."` → rsync `.horizon/metadata.json` back → `git add
+  tasks/redis-persistence-drift/<changed> && git commit`
+- **Pull rollouts** with `horizon rollouts pull` from
+  `~/tasks/redis-persistence-drift/` on VM, then rsync `.rollouts/`
+  back to local (gitignored).
+- **API keys** in `~/Downloads/core/key-info.md`. mini-batch for new
+  task = `99a0adf0-…` (per `[[horizon-creator-mini-batch]]` memory).
 
 ## References cheat-sheet
 
-- `task-hardner.md` Hardening Decision Tree — directly applies to our DEAD@1/DEAD@0
-- `key-info.md` "Behavioral Test Patterns" table — the right reverter design pattern
-- `AGENT_DIFFICULTY_BANK_v2.md` Pattern 1, Anti-pattern #35 (test-variant saturation), Anti-pattern #23 (mechanism diversity)
-- `task-authoring-playbook.md` #16 (hint calibration), #29 (audit all checks after one bug), #30 (HANDOFF.md)
-- `Master guide.md` strict ceiling rules, §V39 sidecar camouflage
+- `task-hardner.md` Hardening Decision Tree — "DEAD@1 + saturated 5+ test
+  variants of same axis → Capability ceiling, drop the axis OR redesign
+  the reverter." We chose redesign (Change 1).
+- `key-info.md` Behavioral Test Patterns — "reverter removed (restart-
+  triggered)" → patch sts command-args, not just in-memory CONFIG.
+- `AGENT_DIFFICULTY_BANK_v2.md` Pattern 1 (Layered Self-Healing, 40-60%
+  variance), Anti-pattern #35 (test-variant saturation — what a2 was),
+  Anti-pattern #23 (mechanism diversity across axes).
+- `task-authoring-playbook.md` #16 (hint calibration, U-curve), #29
+  (audit all checks after one bug), #30 (HANDOFF.md).
+- `Master guide.md` strict-ceiling rules, §V39 sidecar camouflage.
