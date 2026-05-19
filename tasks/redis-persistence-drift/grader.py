@@ -168,11 +168,22 @@ def _data_mount_is_pvc(pod_name):
     return False
 
 
-def _bleat_service_containers():
-    """Return the list of container dicts in the bleater-bleat-service
-    Deployment spec, or None if the Deployment is unreadable / absent."""
+# Deployments where setup.sh plants in-app reverter sidecars. a3 audits
+# every entry — agents must clean ALL of them, not just the obvious
+# bleat-service one. v27 added bleater-timeline-service after v25 batch
+# showed agents reliably finding the single bleat-service sidecar
+# (saturated a3 at 5/5).
+_REVERTER_SIDECAR_DEPLOYMENTS = [
+    "bleater-bleat-service",
+    "bleater-timeline-service",
+]
+
+
+def _deploy_containers(deploy_name):
+    """Return the list of container dicts in the named Deployment's spec,
+    or None if the Deployment is unreadable / absent."""
     _, out, _ = run(
-        KUBECTL + ["get", "deploy", "bleater-bleat-service", "-o", "json"],
+        KUBECTL + ["get", "deploy", deploy_name, "-o", "json"],
         timeout=15,
     )
     out = (out or "").strip()
@@ -274,25 +285,37 @@ def subscore_a_persistence_durability():
         a1_detail = ("round-trip + /data on PVC" if a1_ok else
                      "value_ok=%s pvc_mount=%s got=%r" % (a1_value_ok, a1_pvc_ok, a1_got))
 
-    # a3: behavior-based topology check on bleater-bleat-service. Reads the
-    # Deployment spec, classifies each container by what its command/args
-    # actually DO (not by name), and fails if any container looks like a
-    # redis-config reverter loop. Closes the rename-bypass that an earlier
-    # literal-name match left open.
-    containers = _bleat_service_containers()
-    if containers is None:
-        a3_ok = False
-        a3_detail = ("could not read bleater-bleat-service deployment "
-                     "(missing or inaccessible)")
-    else:
+    # a3: behavior-based topology check on every deployment that setup.sh
+    # plants a reverter sidecar into. Reads each Deployment's spec,
+    # classifies each container by what its command/args actually DO (not
+    # by name), and fails if ANY deployment still has a reverter-shaped
+    # container. Closes both the rename-bypass (behavior-based detection)
+    # AND the "only audit the obvious deployment" path (multi-deployment).
+    per_deploy = []
+    overall_bad = []
+    unreadable = []
+    for deploy in _REVERTER_SIDECAR_DEPLOYMENTS:
+        containers = _deploy_containers(deploy)
+        if containers is None:
+            unreadable.append(deploy)
+            continue
         reverter_names = [c.get("name", "?") for c in containers
                           if _is_reverter_shaped(c)]
         all_names = [c.get("name", "?") for c in containers]
-        a3_ok = len(reverter_names) == 0
-        a3_detail = ("no reverter-shaped sidecar attached (containers=%s)"
-                     % all_names if a3_ok else
-                     "reverter-shaped sidecar(s) attached: %s (containers=%s)"
-                     % (reverter_names, all_names))
+        per_deploy.append((deploy, all_names, reverter_names))
+        if reverter_names:
+            overall_bad.append((deploy, reverter_names))
+    if unreadable:
+        a3_ok = False
+        a3_detail = ("could not read deployment(s): %s" % unreadable)
+    elif overall_bad:
+        a3_ok = False
+        a3_detail = ("reverter-shaped sidecar(s) still attached: %s" %
+                     [(d, names) for d, names in overall_bad])
+    else:
+        a3_ok = True
+        a3_detail = ("no reverter-shaped sidecar in any audited deployment "
+                     "(%s)" % [(d, names) for d, names, _ in per_deploy])
 
     return [int(a1_ok), int(a3_ok)], [
         ("baseline_survives_restart", a1_ok, a1_detail),
@@ -787,12 +810,16 @@ def _b2_grafana_path(rule, pod):
                        "(condition refId or evaluator missing)" % rule_title)
 
     # Pre-injection: known-good cluster. Rule must NOT fire.
+    # PromQL semantics: a vector comparison like `redis_aof_enabled == 0`
+    # returns an empty vector when no series matches the filter, which
+    # _prom_instant_value reports as None. The correct interpretation is
+    # "filter matched no series → rule is not firing" — NOT "could not
+    # evaluate." v25 run2 was a false-negative under the old logic
+    # (agent's expr was `redis_aof_enabled{...} == 0` and the empty
+    # pre-injection result was misclassified as eval failure).
     pre_val = _prom_instant_value(expr)
-    pre_fires = _evaluate_threshold(op, threshold_val, pre_val)
-    if pre_fires is None:
-        return False, ("could not evaluate rule %s pre-injection (expr=%r "
-                       "value=%r threshold=%s %s)" %
-                       (rule_title, expr, pre_val, op, threshold_val))
+    pre_fires = (False if pre_val is None
+                 else bool(_evaluate_threshold(op, threshold_val, pre_val)))
     if pre_fires:
         return False, ("rule %s would fire in a known-good cluster "
                        "(pre-injection value=%s threshold=%s %s) — "
@@ -809,11 +836,8 @@ def _b2_grafana_path(rule, pod):
         # instant query reflects the post-injection value.
         time.sleep(2)
         post_val = _prom_instant_value(expr)
-        post_fires = _evaluate_threshold(op, threshold_val, post_val)
-        if post_fires is None:
-            return False, ("could not evaluate rule %s post-injection "
-                           "(expr=%r value=%r threshold=%s %s)" %
-                           (rule_title, expr, post_val, op, threshold_val))
+        post_fires = (False if post_val is None
+                      else bool(_evaluate_threshold(op, threshold_val, post_val)))
         if post_fires:
             return True, ("rule %s transitioned (pre=%s post=%s threshold=%s %s)"
                           % (rule_title, pre_val, post_val, op, threshold_val))

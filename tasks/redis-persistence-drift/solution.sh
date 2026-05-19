@@ -28,29 +28,34 @@ kubectl -n monitoring delete serviceaccount redis-config-watchdog --ignore-not-f
 kubectl -n monitoring delete cronjob redis-fsync-tuner --ignore-not-found >/dev/null 2>&1 || true
 kubectl -n monitoring delete job -l app=redis-fsync-tuner --ignore-not-found >/dev/null 2>&1 || true
 
-# Reverter 3: sidecar inside bleater-bleat-service Deployment. Aggressive
-# 5s loop hits redis via the headless service. Has to go before we restart
-# Redis, otherwise the sidecar would re-disable persistence within seconds.
-# Use a targeted JSON patch (symmetric with setup.sh's `op:add containers/-`)
-# instead of a YAML-rebuild-and-apply round-trip — the previous approach
-# silently failed in validation (a3 saw the sidecar still attached) because
-# `kubectl apply` on the rebuilt deployment YAML was rejected and the
-# `|| true` masked the error.
-echo "[solution] Removing cache-config-tuner sidecar from bleater-bleat-service..."
-if kubectl -n "$NS" get deploy bleater-bleat-service >/dev/null 2>&1; then
-  IDX=$(kubectl -n "$NS" get deploy bleater-bleat-service \
-    -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' \
-    | awk '/^cache-config-tuner$/{print NR-1; exit}')
-  if [ -n "$IDX" ]; then
-    PATCH="[{\"op\":\"remove\",\"path\":\"/spec/template/spec/containers/${IDX}\"}]"
-    if ! kubectl -n "$NS" patch deploy bleater-bleat-service \
-         --type=json -p="$PATCH"; then
-      echo "[solution] ERROR: failed to remove cache-config-tuner sidecar"
-      exit 1
+# Reverters 3 + 4: in-app sidecars (cache-config-tuner in
+# bleater-bleat-service, redis-pool-sizer in bleater-timeline-service).
+# Both are 5-7s loops that flip CONFIG SET appendonly no on the headless
+# service. Must go before we restart Redis, otherwise either sidecar
+# would re-disable persistence within seconds.
+# Targeted JSON patch by container index (looked up via jsonpath +
+# awk) — symmetric with setup.sh's `op:add /spec/template/spec/
+# containers/-` insertion. Fails loud on patch error.
+for entry in "bleater-bleat-service cache-config-tuner" \
+             "bleater-timeline-service redis-pool-sizer"; do
+  set -- $entry
+  DEPLOY="$1"
+  SIDECAR="$2"
+  echo "[solution] Removing ${SIDECAR} sidecar from ${DEPLOY}..."
+  if kubectl -n "$NS" get deploy "$DEPLOY" >/dev/null 2>&1; then
+    IDX=$(kubectl -n "$NS" get deploy "$DEPLOY" \
+      -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' \
+      | awk -v name="$SIDECAR" '$0 == name {print NR-1; exit}')
+    if [ -n "$IDX" ]; then
+      PATCH="[{\"op\":\"remove\",\"path\":\"/spec/template/spec/containers/${IDX}\"}]"
+      if ! kubectl -n "$NS" patch deploy "$DEPLOY" --type=json -p="$PATCH"; then
+        echo "[solution] ERROR: failed to remove ${SIDECAR} from ${DEPLOY}"
+        exit 1
+      fi
+      kubectl -n "$NS" rollout status "deploy/${DEPLOY}" --timeout=90s || true
     fi
-    kubectl -n "$NS" rollout status deploy/bleater-bleat-service --timeout=90s || true
   fi
-fi
+done
 
 echo "[solution] Reading current redis StatefulSet..."
 ORIG=$(mktemp)

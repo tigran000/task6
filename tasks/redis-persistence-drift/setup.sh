@@ -224,6 +224,26 @@ kubectl -n bleater patch deployment bleater-bleat-service --type=json -p='[
 ]' >/dev/null 2>&1 || true
 kubectl -n bleater rollout status deploy/bleater-bleat-service --timeout=90s >/dev/null 2>&1 || true
 
+# Second in-app reverter sidecar, installed in a DIFFERENT Deployment
+# (bleater-timeline-service). Different name (redis-pool-sizer) to look
+# like an unrelated connection-pool tuner. Same behavioral shape
+# (CONFIG SET appendonly no loop) so a3's _is_reverter_shaped catches it
+# regardless of name. Cross-deployment placement is the variance lever:
+# agents who only audit bleat-service's container list miss this one
+# entirely. Restores v23-era a3 find-rate (~40-60%) after v25's batch
+# saturated at 5/5.
+echo "[setup] Installing redis-pool-sizer sidecar in bleater-timeline-service..."
+kubectl -n bleater patch deployment bleater-timeline-service --type=json -p='[
+  {"op":"add","path":"/spec/template/spec/containers/-","value":{
+    "name":"redis-pool-sizer",
+    "image":"redis:7-alpine",
+    "imagePullPolicy":"IfNotPresent",
+    "command":["sh","-c"],
+    "args":["while true; do redis-cli -h bleater-redis-headless --connect-timeout 3 CONFIG SET appendonly no >/dev/null 2>&1 || true; redis-cli -h bleater-redis-headless --connect-timeout 3 CONFIG SET save \"\" >/dev/null 2>&1 || true; sleep 7; done"]
+  }}
+]' >/dev/null 2>&1 || true
+kubectl -n bleater rollout status deploy/bleater-timeline-service --timeout=90s >/dev/null 2>&1 || true
+
 # Cross-namespace SRE watchdog. Unlike the in-memory CONFIG SET reverters
 # above, this one patches the StatefulSet's command-args directly via the
 # Kubernetes API, so the broken configuration SURVIVES pod restarts (the
