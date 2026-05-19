@@ -31,25 +31,25 @@ kubectl -n monitoring delete job -l app=redis-fsync-tuner --ignore-not-found >/d
 # Reverter 3: sidecar inside bleater-bleat-service Deployment. Aggressive
 # 5s loop hits redis via the headless service. Has to go before we restart
 # Redis, otherwise the sidecar would re-disable persistence within seconds.
+# Use a targeted JSON patch (symmetric with setup.sh's `op:add containers/-`)
+# instead of a YAML-rebuild-and-apply round-trip — the previous approach
+# silently failed in validation (a3 saw the sidecar still attached) because
+# `kubectl apply` on the rebuilt deployment YAML was rejected and the
+# `|| true` masked the error.
 echo "[solution] Removing cache-config-tuner sidecar from bleater-bleat-service..."
-BLEAT=$(mktemp)
-kubectl -n "$NS" get deploy bleater-bleat-service -o yaml > "$BLEAT" 2>/dev/null || true
-if [ -s "$BLEAT" ]; then
-  BLEAT_FIXED=$(mktemp)
-  python3 - "$BLEAT" "$BLEAT_FIXED" <<'PY' || true
-import sys, yaml
-src, dst = sys.argv[1], sys.argv[2]
-d = yaml.safe_load(open(src).read())
-md = d.get("metadata", {})
-for f in ("creationTimestamp","resourceVersion","uid","generation","managedFields"):
-    md.pop(f, None)
-d.pop("status", None)
-spec = d["spec"]["template"]["spec"]
-spec["containers"] = [c for c in spec.get("containers", []) if c.get("name") != "cache-config-tuner"]
-open(dst, "w").write(yaml.safe_dump(d))
-PY
-  kubectl apply -f "$BLEAT_FIXED" >/dev/null 2>&1 || true
-  kubectl -n "$NS" rollout status deploy/bleater-bleat-service --timeout=90s >/dev/null 2>&1 || true
+if kubectl -n "$NS" get deploy bleater-bleat-service >/dev/null 2>&1; then
+  IDX=$(kubectl -n "$NS" get deploy bleater-bleat-service \
+    -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' \
+    | awk '/^cache-config-tuner$/{print NR-1; exit}')
+  if [ -n "$IDX" ]; then
+    PATCH="[{\"op\":\"remove\",\"path\":\"/spec/template/spec/containers/${IDX}\"}]"
+    if ! kubectl -n "$NS" patch deploy bleater-bleat-service \
+         --type=json -p="$PATCH"; then
+      echo "[solution] ERROR: failed to remove cache-config-tuner sidecar"
+      exit 1
+    fi
+    kubectl -n "$NS" rollout status deploy/bleater-bleat-service --timeout=90s || true
+  fi
 fi
 
 echo "[solution] Reading current redis StatefulSet..."
