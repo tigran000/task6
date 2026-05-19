@@ -365,17 +365,33 @@ def _read_grafana_provisioned_rules():
     return rules
 
 
-def _grafana_rule_metric_expr(rule):
-    """Find the rule's primary prometheus-datasource data item and return its
-    `model.expr` (the PromQL expression Grafana would evaluate). Returns "" if
-    no such item exists."""
+def _grafana_rule_matching_expr(rule):
+    """Scan every prometheus-datasource data item in `rule` and return
+    (expr, metric) for the FIRST one whose `model.expr` matches the
+    redis-exporter persistence metric whitelist (`_b_metric_pattern`).
+    Returns ("", None) if no such item exists.
+
+    Grafana UnifiedAlerting rules carry a `data` array of refIds, and the
+    convention is refId A = query, B = reduce, C = threshold. That is
+    convention only, not contract — multi-query rules with the redis
+    metric in B or later are valid. Scanning every refId (rather than
+    just refId A) prevents b1 from silently missing those.
+
+    Both `_find_matching_grafana_rule` (for b1 discovery) and
+    `_b2_grafana_path` (for the threshold eval) call this with the same
+    rule, so the expr they pick is guaranteed consistent.
+    """
     for item in (rule.get("data") or []):
-        if item.get("datasourceUid") == "prometheus":
-            model = item.get("model") or {}
-            expr = model.get("expr") or ""
-            if expr:
-                return expr.strip()
-    return ""
+        if item.get("datasourceUid") != "prometheus":
+            continue
+        model = item.get("model") or {}
+        expr = (model.get("expr") or "").strip()
+        if not expr:
+            continue
+        m = _b_metric_pattern.search(expr)
+        if m:
+            return expr, m.group(0)
+    return "", None
 
 
 def _grafana_rule_threshold(rule):
@@ -407,19 +423,24 @@ def _grafana_rule_threshold(rule):
 
 
 def _find_matching_grafana_rule():
-    """Scan the Grafana provisioning CM for an alert rule whose primary
-    prometheus expression references a redis-exporter persistence metric.
-    Returns (rule_dict, metric, err)."""
+    """Scan the Grafana provisioning CM for an alert rule with ANY
+    prometheus-datasource expression that references a redis-exporter
+    persistence metric (every refId scanned, not just the first).
+    Returns (rule_dict, metric, err).
+
+    Note: this cluster has no prometheus-operator (its prometheus.yml
+    does not declare a `kube_state` or `kube_apiserver` config and the
+    `alertmanagers:` stanza is commented out, per the v23 run1 transcript
+    dump). PrometheusRule CRD objects therefore have nowhere to reconcile
+    to, so we do not probe for them. If a future setup.sh installs the
+    operator, add a third store check next to this one."""
     rules = _read_grafana_provisioned_rules()
     if not rules:
         return None, None, "no rules in grafana-alerting-provisioning"
     for r in rules:
-        expr = _grafana_rule_metric_expr(r)
-        if not expr:
-            continue
-        m = _b_metric_pattern.search(expr)
-        if m:
-            return r, m.group(0), None
+        expr, metric = _grafana_rule_matching_expr(r)
+        if metric is not None:
+            return r, metric, None
     return None, None, "no Grafana rule references a redis-exporter persistence metric"
 
 
@@ -757,10 +778,10 @@ def _b2_grafana_path(rule, pod):
     (rule does not fire when persistence is broken) the same way the
     Prometheus path does."""
     rule_title = rule.get("title") or rule.get("uid") or "?"
-    expr = _grafana_rule_metric_expr(rule)
+    expr, _ = _grafana_rule_matching_expr(rule)
     if not expr:
         return False, ("rule %s has no prometheus-datasource expression "
-                       "to evaluate" % rule_title)
+                       "matching the metric whitelist" % rule_title)
     op, threshold_val = _grafana_rule_threshold(rule)
     if op is None:
         return False, ("rule %s has no parseable threshold step "
