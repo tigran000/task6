@@ -227,17 +227,21 @@ def subscore_a_persistence_durability():
                                               trip fails. Agents must kill
                                               the watchdog AND its RBAC for
                                               this check to pass.
-    a3 no_unexpected_sidecar_in_bleat_service —
+    a3 no_reverter_sidecar_in_bleat_service —
                                               Independent topology check.
                                               The bleater-bleat-service
-                                              Deployment must not contain a
-                                              `cache-config-tuner` sidecar
-                                              (the camouflaged 5s reverter).
+                                              Deployment must not contain
+                                              any container whose command/
+                                              args call `CONFIG SET appendonly
+                                              no` / `save ""` / `appendfsync
+                                              no` in a loop (behavior-based,
+                                              so renames don't bypass).
                                               Catches agents who repaired
                                               persistence but missed the
-                                              sidecar — the lowest-visibility
-                                              reverter, hidden inside another
-                                              app's container list.
+                                              camouflaged 5s sidecar — the
+                                              lowest-visibility reverter,
+                                              hidden inside another app's
+                                              container list.
     """
     pod = wait_for_redis(timeout=120)
     if not pod:
