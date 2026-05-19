@@ -450,8 +450,10 @@ def _grafana_rule_threshold(rule):
 def _find_matching_grafana_rule():
     """Scan the Grafana provisioning CM for an alert rule with ANY
     prometheus-datasource expression that references a redis-exporter
-    persistence metric (every refId scanned, not just the first).
-    Returns (rule_dict, metric, err).
+    persistence metric (every refId scanned, not just the first), AND
+    whose threshold can distinguish a known-good metric from a known-bad
+    one (rejects decorative `redis_aof_enabled > 9999999`-style rules
+    at discovery time). Returns (rule_dict, metric, err).
 
     Note: this cluster has no prometheus-operator (its prometheus.yml
     does not declare a `kube_state` or `kube_apiserver` config and the
@@ -464,9 +466,15 @@ def _find_matching_grafana_rule():
         return None, None, "no rules in grafana-alerting-provisioning"
     for r in rules:
         expr, metric = _grafana_rule_matching_expr(r)
-        if metric is not None:
-            return r, metric, None
-    return None, None, "no Grafana rule references a redis-exporter persistence metric"
+        if metric is None:
+            continue
+        op, threshold_val = _grafana_rule_threshold(r)
+        if not _is_plausibly_calibrated_threshold(metric, op, threshold_val):
+            # Skip decorative rules — keep scanning for a real one.
+            continue
+        return r, metric, None
+    return None, None, ("no Grafana rule references a redis-exporter "
+                        "persistence metric with a plausibly-calibrated threshold")
 
 
 def _read_grafana_api_rules():
@@ -478,49 +486,64 @@ def _read_grafana_api_rules():
     to `_read_grafana_provisioned_rules`. v25 run1's agent did exactly
     this and was unfairly rejected by b1.
 
-    Authentication: default cluster credentials are admin/admin (verified
-    against v25 transcripts where agents successfully called this endpoint
-    with the same auth). If an agent rotated the password during the run
-    the probe falls through quietly — acceptable since the rule would
-    then also be invisible to operations.
+    Authentication: try the wiki-documented `admin:admin123` first, then
+    fall back to Grafana's built-in default `admin:admin`. v25 transcripts
+    show agents successfully calling this endpoint with both; the cluster's
+    actual configured password is in the `grafana-ini-config` ConfigMap.
+    If neither works (e.g., agent rotated the password), the probe falls
+    through quietly — acceptable since the rule would then also be
+    invisible to ops.
 
     Returns a list of rule dicts (same shape as file-provisioned rules:
     `data`, `condition`, `title`, `uid`), or [] on any failure / no rules.
     """
-    cmd = [
-        "kubectl", "-n", PROM_NS, "exec", "deploy/grafana", "--",
-        "sh", "-c",
-        "curl -s -u admin:admin "
-        "http://localhost:3000/api/v1/provisioning/alert-rules",
-    ]
-    _, out, _ = run(cmd, timeout=15)
-    text = (out or "").strip()
-    if not text:
-        return []
-    try:
-        rules = json.loads(text)
-    except Exception:
-        return []
-    if not isinstance(rules, list):
-        return []
-    return rules
+    for pwd in ("admin123", "admin"):
+        cmd = [
+            "kubectl", "-n", PROM_NS, "exec", "deploy/grafana", "--",
+            "sh", "-c",
+            (r"curl -s -w '\n%{http_code}' -u admin:" + pwd + " "
+             "http://localhost:3000/api/v1/provisioning/alert-rules"),
+        ]
+        _, out, _ = run(cmd, timeout=15)
+        text = (out or "").strip()
+        if not text:
+            continue
+        # Last line is the HTTP status code (curl -w '\n%{http_code}').
+        idx = text.rfind("\n")
+        if idx == -1:
+            continue
+        body, code = text[:idx], text[idx + 1:].strip()
+        if code != "200":
+            continue
+        try:
+            rules = json.loads(body)
+        except Exception:
+            continue
+        if isinstance(rules, list):
+            return rules
+    return []
 
 
 def _find_matching_grafana_api_rule():
     """Scan Grafana's runtime API alert-rule store for a rule whose ANY
     prometheus-datasource expression references a redis-exporter persistence
-    metric. Same parser as the file-provisioning path — runtime rule shape
-    is identical to YAML provisioning rule shape.
+    metric AND whose threshold is plausibly calibrated. Same parser as the
+    file-provisioning path — runtime rule shape is identical to YAML
+    provisioning rule shape.
     Returns (rule_dict, metric, err)."""
     rules = _read_grafana_api_rules()
     if not rules:
         return None, None, "no rules in grafana runtime API store"
     for r in rules:
         expr, metric = _grafana_rule_matching_expr(r)
-        if metric is not None:
-            return r, metric, None
+        if metric is None:
+            continue
+        op, threshold_val = _grafana_rule_threshold(r)
+        if not _is_plausibly_calibrated_threshold(metric, op, threshold_val):
+            continue
+        return r, metric, None
     return None, None, ("no Grafana API rule references a redis-exporter "
-                        "persistence metric")
+                        "persistence metric with a plausibly-calibrated threshold")
 
 
 def _find_matching_alert_rule():
@@ -545,6 +568,37 @@ def _find_matching_alert_rule():
         return r, m, "grafana_api", None
     return None, None, None, ("%s; %s; %s" %
                               (err_p or "?", err_g or "?", err_ga or "?"))
+
+
+# Known-good vs known-bad metric values per redis-exporter persistence
+# metric, used by `_is_plausibly_calibrated_threshold` to reject Grafana
+# rules whose threshold cannot distinguish a healthy cluster from a broken
+# one (e.g., `redis_aof_enabled > 9999999` always-off, or `< 9999999`
+# always-on). The reviewer's polish item 5 — kills the silliest gaming
+# at discovery time rather than relying solely on b2's pre-state gate.
+_METRIC_GOOD_BAD_TEST = {
+    "redis_aof_enabled": (1.0, 0.0),
+    "redis_rdb_changes_since_last_save": (0.0, 1000.0),
+    "redis_rdb_last_bgsave_status": (1.0, 0.0),
+    "redis_aof_last_write_status": (1.0, 0.0),
+}
+
+
+def _is_plausibly_calibrated_threshold(metric, op, threshold_value):
+    """Return True iff the rule's threshold distinguishes a known-good
+    metric value (rule should NOT fire) from a known-bad one (rule SHOULD
+    fire). Returns True for metrics we don't have test values for (don't
+    block on unknown shapes). Returns True when threshold_value is None
+    (can't evaluate, defer to b2)."""
+    if threshold_value is None or op is None:
+        return True
+    test = _METRIC_GOOD_BAD_TEST.get(metric)
+    if test is None:
+        return True
+    good_val, bad_val = test
+    good_fires = _evaluate_threshold(op, threshold_value, good_val)
+    bad_fires = _evaluate_threshold(op, threshold_value, bad_val)
+    return (good_fires is False) and (bad_fires is True)
 
 
 def _evaluate_threshold(op, threshold_value, observed_value):
@@ -834,7 +888,18 @@ def _restore_cluster_after_b2(state):
 
 def _b2_prometheus_path(rule, pod):
     """Behavioral b2 for a Prometheus-loaded rule. Verify state TRANSITIONS
-    from inactive to pending/firing under injection. Returns (ok, detail)."""
+    from inactive to pending/firing under injection. Returns (ok, detail).
+
+    Audit (item 6, post-v25): the Grafana path had an empty-vector
+    misclassification (None pre_val treated as eval failure). The Prometheus
+    path does NOT have the same bug because the mechanism is different: we
+    poll Prometheus's own /api/v1/alerts endpoint, and Prometheus omits
+    inactive rules from that response. _current_alert_state returns
+    "inactive" when the rule's alertname is absent, "unknown" only when
+    /api/v1/alerts cannot be reached at all. Both states are interpreted
+    correctly (inactive → not firing; unknown → sanity-fail). No empty-
+    result-of-PromQL-expression path runs here, so there is no analogous
+    misclassification to fix."""
     rule_name = rule.get("name", "")
     pre_state = _current_alert_state(rule_name)
     if pre_state == "unknown":
