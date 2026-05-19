@@ -14,26 +14,39 @@ between-subscore checks are independent code paths.
          redis-config-watchdog) is still alive and has flipped the sts
          to `--appendonly no` and `--save ""`, the new pod loads from
          RDB but writes after the last BGSAVE are lost on the next cycle.
-      a3 no_unexpected_sidecar_in_bleat_service
-         The bleater-bleat-service Deployment must contain ONLY its
-         legitimate containers — specifically, no `cache-config-tuner`
-         sidecar (the aggressive 5s in-memory CONFIG SET loop installed
-         by setup). Without this check, agents who repaired the sts but
-         missed the sidecar would still appear to pass A, because the
-         sidecar's effect doesn't survive a pod restart (in-memory only).
+      a3 no_reverter_sidecar_in_bleat_service
+         The bleater-bleat-service Deployment must contain no container
+         whose command/args look like a redis-config reverter — anything
+         calling `CONFIG SET appendonly no`, `CONFIG SET save ""`, or
+         `CONFIG SET appendfsync no` in a loop. Behavior-based, so an
+         agent who renames the cache-config-tuner sidecar to something
+         benign still fails this check.
 
   B alert_observability     (weight 0.5)
       b1 alert_rule_loaded
-         Prometheus /api/v1/rules has an alerting rule (type=alerting,
-         health=ok) whose expr references a redis-exporter persistence
-         metric in the accepted set.
+         Path-store-agnostic. Accepts EITHER (i) an alerting rule
+         loaded by Prometheus via /api/v1/rules whose expr references a
+         redis-exporter persistence metric, OR (ii) a Grafana
+         UnifiedAlerting rule provisioned through the cluster's
+         `monitoring/grafana-alerting-provisioning` ConfigMap whose
+         primary prometheus-data-source `model.expr` references the
+         same metric set. Tests the realistic capability ("wire an
+         alert visible to the platform's monitoring stack"), not the
+         meta-capability ("guess which store the grader prefers").
       b2 alert_fires_on_synthetic_failure  (BEHAVIORAL)
-         Inject failure (flip appendonly to no, disable save policy,
-         write 200 keys), poll /api/v1/alerts up to 60s expecting the
-         agent's alert to reach pending or firing. Pending counts; the
-         for: clause length does not matter. State restored in finally.
-         A decorative `expr: redis_aof_enabled == 1` would not fire,
-         because the injection flips the metric to 0.
+         Same isolation as v23: suspend reverters, scale bleat-service
+         to 0, patch sts to known-good, wait for redis_aof_enabled=1.
+         Then dispatch by rule source:
+           Prometheus rule  → inject failure, poll /api/v1/alerts up
+                              to 60s for pending|firing. Pre-state
+                              must be inactive (catches decoration).
+           Grafana rule     → query Prometheus instant API for the
+                              rule's primary model.expr in both pre-
+                              and post-injection states, apply the
+                              rule's threshold condition. Pre-state
+                              must NOT trigger (catches decoration);
+                              post-state MUST trigger.
+         State restored in finally regardless of source.
 
 A and B are fully independent. A is measured against the cluster state
 the agent left behind. Before B starts measuring, the grader takes
@@ -52,6 +65,7 @@ import json
 import re
 import subprocess
 import time
+import urllib.parse
 import uuid
 
 NS = "bleater"
@@ -155,23 +169,44 @@ def _data_mount_is_pvc(pod_name):
     return False
 
 
-_BLEAT_SERVICE_FORBIDDEN_SIDECARS = {"cache-config-tuner"}
-
-
-def _bleat_service_container_names():
-    """Return the list of container names currently in the bleater-bleat-service
-    Deployment, or None if the Deployment is unreadable / absent."""
+def _bleat_service_containers():
+    """Return the list of container dicts in the bleater-bleat-service
+    Deployment spec, or None if the Deployment is unreadable / absent."""
     _, out, _ = run(
-        KUBECTL + [
-            "get", "deploy", "bleater-bleat-service",
-            "-o", "jsonpath={.spec.template.spec.containers[*].name}",
-        ],
+        KUBECTL + ["get", "deploy", "bleater-bleat-service", "-o", "json"],
         timeout=15,
     )
-    text = (out or "").strip()
-    if not text:
+    out = (out or "").strip()
+    if not out:
         return None
-    return text.split()
+    try:
+        d = json.loads(out)
+        return (d.get("spec", {})
+                 .get("template", {})
+                 .get("spec", {})
+                 .get("containers", []))
+    except Exception:
+        return None
+
+
+def _is_reverter_shaped(container):
+    """Behavior-based detection of a redis-config reverter container.
+    Catches the cache-config-tuner sidecar AND any rename of it: anything
+    whose command/args looks like a redis-cli loop that flips persistence
+    config (`CONFIG SET appendonly no` or `CONFIG SET save ""`)."""
+    parts = (container.get("command") or []) + (container.get("args") or [])
+    joined = " ".join(parts).lower()
+    if "config set" not in joined:
+        return False
+    if "appendonly" in joined and " no" in joined:
+        return True
+    if "appendfsync" in joined and " no" in joined:
+        return True
+    # `CONFIG SET save ""` — the empty string survives the .lower() pipeline
+    # as just two quotes; look for the disabling pattern directly.
+    if " save " in joined and ('""' in joined or "''" in joined):
+        return True
+    return False
 
 
 def subscore_a_persistence_durability():
@@ -208,7 +243,7 @@ def subscore_a_persistence_durability():
     if not pod:
         return [0, 0], [
             ("baseline_survives_restart", False, "no redis pre-probe"),
-            ("no_unexpected_sidecar_in_bleat_service", False,
+            ("no_reverter_sidecar_in_bleat_service", False,
              "redis unavailable; cannot validate cluster state"),
         ]
 
@@ -236,26 +271,29 @@ def subscore_a_persistence_durability():
         a1_detail = ("round-trip + /data on PVC" if a1_ok else
                      "value_ok=%s pvc_mount=%s got=%r" % (a1_value_ok, a1_pvc_ok, a1_got))
 
-    # a3: topology check on bleater-bleat-service. Independent code path
-    # from a1 — does not depend on Redis at all, only on the Deployment
-    # spec. Reads container names; fails if any forbidden sidecar is still
-    # attached.
-    names = _bleat_service_container_names()
-    if names is None:
+    # a3: behavior-based topology check on bleater-bleat-service. Reads the
+    # Deployment spec, classifies each container by what its command/args
+    # actually DO (not by name), and fails if any container looks like a
+    # redis-config reverter loop. Closes the rename-bypass that an earlier
+    # literal-name match left open.
+    containers = _bleat_service_containers()
+    if containers is None:
         a3_ok = False
         a3_detail = ("could not read bleater-bleat-service deployment "
                      "(missing or inaccessible)")
     else:
-        bad = [n for n in names if n in _BLEAT_SERVICE_FORBIDDEN_SIDECARS]
-        a3_ok = len(bad) == 0
-        a3_detail = ("no forbidden sidecar attached (containers=%s)" % names
-                     if a3_ok else
-                     "forbidden sidecar(s) still attached: %s (containers=%s)"
-                     % (bad, names))
+        reverter_names = [c.get("name", "?") for c in containers
+                          if _is_reverter_shaped(c)]
+        all_names = [c.get("name", "?") for c in containers]
+        a3_ok = len(reverter_names) == 0
+        a3_detail = ("no reverter-shaped sidecar attached (containers=%s)"
+                     % all_names if a3_ok else
+                     "reverter-shaped sidecar(s) attached: %s (containers=%s)"
+                     % (reverter_names, all_names))
 
     return [int(a1_ok), int(a3_ok)], [
         ("baseline_survives_restart", a1_ok, a1_detail),
-        ("no_unexpected_sidecar_in_bleat_service", a3_ok, a3_detail),
+        ("no_reverter_sidecar_in_bleat_service", a3_ok, a3_detail),
     ]
 
 
@@ -274,10 +312,9 @@ def _prom_query(path, timeout=15):
         return None, "non-json from prometheus" + path
 
 
-def _find_matching_alert_rule():
-    """Scan /api/v1/rules for an alerting rule whose expr references a
-    redis-exporter persistence metric. Returns (rule_dict, matched_metric,
-    err_msg)."""
+def _find_matching_prometheus_rule():
+    """Scan Prometheus /api/v1/rules for an alerting rule whose expr references
+    a redis-exporter persistence metric. Returns (rule_dict, metric, err)."""
     data, err = _prom_query("/api/v1/rules")
     if data is None:
         return None, None, err
@@ -291,7 +328,144 @@ def _find_matching_alert_rule():
             m = _b_metric_pattern.search(expr)
             if m:
                 return r, m.group(0), None
-    return None, None, "no alerting rule references a redis-exporter persistence metric"
+    return None, None, "no Prometheus rule references a redis-exporter persistence metric"
+
+
+def _read_grafana_provisioned_rules():
+    """Read the cluster's Grafana UnifiedAlerting provisioning ConfigMap
+    (monitoring/grafana-alerting-provisioning, key alert-rules.yaml) and
+    return the list of rule dicts (flattened across all groups), or [] if
+    the CM or key is missing / unparseable."""
+    _, out, _ = run(
+        ["kubectl", "-n", PROM_NS, "get", "cm",
+         "grafana-alerting-provisioning", "-o",
+         r"jsonpath={.data.alert-rules\.yaml}"],
+        timeout=15,
+    )
+    text = (out or "").strip()
+    if not text:
+        return []
+    # Lazy-import yaml — apex base image ships it but be defensive.
+    try:
+        import yaml
+    except Exception:
+        return []
+    try:
+        doc = yaml.safe_load(text) or {}
+    except Exception:
+        return []
+    rules = []
+    for g in (doc.get("groups") or []):
+        for r in (g.get("rules") or []):
+            rules.append(r)
+    return rules
+
+
+def _grafana_rule_metric_expr(rule):
+    """Find the rule's primary prometheus-datasource data item and return its
+    `model.expr` (the PromQL expression Grafana would evaluate). Returns "" if
+    no such item exists."""
+    for item in (rule.get("data") or []):
+        if item.get("datasourceUid") == "prometheus":
+            model = item.get("model") or {}
+            expr = model.get("expr") or ""
+            if expr:
+                return expr.strip()
+    return ""
+
+
+def _grafana_rule_threshold(rule):
+    """Find the rule's `condition`-refId data item (the threshold step) and
+    return (op, value) extracted from its first evaluator. op ∈
+    {gt, lt, gte, lte, eq, within_range, outside_range}; value is float.
+    Returns (None, None) if not parseable."""
+    cond_refid = rule.get("condition")
+    if not cond_refid:
+        return None, None
+    for item in (rule.get("data") or []):
+        if item.get("refId") != cond_refid:
+            continue
+        model = item.get("model") or {}
+        if model.get("type") != "threshold":
+            continue
+        conditions = model.get("conditions") or []
+        if not conditions:
+            continue
+        ev = (conditions[0] or {}).get("evaluator") or {}
+        op = ev.get("type")
+        params = ev.get("params") or []
+        if op and params:
+            try:
+                return op, float(params[0])
+            except (TypeError, ValueError):
+                return None, None
+    return None, None
+
+
+def _find_matching_grafana_rule():
+    """Scan the Grafana provisioning CM for an alert rule whose primary
+    prometheus expression references a redis-exporter persistence metric.
+    Returns (rule_dict, metric, err)."""
+    rules = _read_grafana_provisioned_rules()
+    if not rules:
+        return None, None, "no rules in grafana-alerting-provisioning"
+    for r in rules:
+        expr = _grafana_rule_metric_expr(r)
+        if not expr:
+            continue
+        m = _b_metric_pattern.search(expr)
+        if m:
+            return r, m.group(0), None
+    return None, None, "no Grafana rule references a redis-exporter persistence metric"
+
+
+def _find_matching_alert_rule():
+    """Path-store-agnostic discovery. Returns (rule, metric, source, err),
+    where source ∈ {"prometheus", "grafana"}. Prometheus is preferred when
+    both stores have a matching rule (consistent with v20 behavior for
+    agents who took the Prometheus path)."""
+    r, m, err_p = _find_matching_prometheus_rule()
+    if r is not None:
+        return r, m, "prometheus", None
+    r, m, err_g = _find_matching_grafana_rule()
+    if r is not None:
+        return r, m, "grafana", None
+    return None, None, None, "%s; %s" % (err_p or "?", err_g or "?")
+
+
+def _evaluate_threshold(op, threshold_value, observed_value):
+    """Apply a Grafana threshold evaluator to an observed metric value."""
+    if observed_value is None or threshold_value is None or op is None:
+        return None
+    if op == "gt":
+        return observed_value > threshold_value
+    if op == "lt":
+        return observed_value < threshold_value
+    if op == "gte":
+        return observed_value >= threshold_value
+    if op == "lte":
+        return observed_value <= threshold_value
+    if op == "eq":
+        return observed_value == threshold_value
+    return None
+
+
+def _prom_instant_value(expr, timeout=15):
+    """Evaluate a PromQL expression via Prometheus /api/v1/query and return
+    the first-series scalar value as a float, or None if the result is empty
+    / unparseable."""
+    q = urllib.parse.quote(expr, safe="")
+    data, _ = _prom_query("/api/v1/query?query=" + q, timeout=timeout)
+    if not data:
+        return None
+    result = (data.get("data") or {}).get("result") or []
+    if not result:
+        return None
+    val_pair = result[0].get("value") or [None, None]
+    try:
+        return float(val_pair[1])
+    except (TypeError, ValueError):
+        return None
 
 
 # Accepted metric families for a "Redis persistence regressed" alert.
@@ -544,30 +718,116 @@ def _restore_cluster_after_b2(state):
     _unsuspend_reverter_cronjobs(state.get("suspended_cronjobs") or [])
 
 
+def _b2_prometheus_path(rule, pod):
+    """Behavioral b2 for a Prometheus-loaded rule. Verify state TRANSITIONS
+    from inactive to pending/firing under injection. Returns (ok, detail)."""
+    rule_name = rule.get("name", "")
+    pre_state = _current_alert_state(rule_name)
+    if pre_state == "unknown":
+        return False, ("could not determine pre-injection alert state "
+                       "(prometheus /api/v1/alerts unavailable)")
+    if pre_state in ("pending", "firing"):
+        return False, ("alert %s was already %s in a known-good cluster "
+                       "(decorative / always-fires rule)" %
+                       (rule_name, pre_state))
+    snapshot = _snapshot_persistence_config(pod)
+    try:
+        _inject_persistence_failure(pod)
+        fired, state = _poll_alert_pending_or_firing(rule_name, timeout=60)
+        if fired:
+            return True, ("alert %s transitioned %s -> %s under injection" %
+                          (rule_name, pre_state, state))
+        return False, ("alert %s did not transition out of %s within 60s "
+                       "of synthetic failure injection" % (rule_name, pre_state))
+    finally:
+        _restore_persistence_config(pod, snapshot)
+
+
+def _b2_grafana_path(rule, pod):
+    """Behavioral b2 for a Grafana-provisioned rule. Grafana's alert state
+    machinery requires authenticated access to the Grafana HTTP API and is
+    awkward to poll from inside the grader. Instead, evaluate the rule's
+    primary prometheus expression in both pre- and post-injection cluster
+    states and apply the rule's threshold condition manually. This catches
+    decoration (rule fires in a known-good cluster) and stuck-off rules
+    (rule does not fire when persistence is broken) the same way the
+    Prometheus path does."""
+    rule_title = rule.get("title") or rule.get("uid") or "?"
+    expr = _grafana_rule_metric_expr(rule)
+    if not expr:
+        return False, ("rule %s has no prometheus-datasource expression "
+                       "to evaluate" % rule_title)
+    op, threshold_val = _grafana_rule_threshold(rule)
+    if op is None:
+        return False, ("rule %s has no parseable threshold step "
+                       "(condition refId or evaluator missing)" % rule_title)
+
+    # Pre-injection: known-good cluster. Rule must NOT fire.
+    pre_val = _prom_instant_value(expr)
+    pre_fires = _evaluate_threshold(op, threshold_val, pre_val)
+    if pre_fires is None:
+        return False, ("could not evaluate rule %s pre-injection (expr=%r "
+                       "value=%r threshold=%s %s)" %
+                       (rule_title, expr, pre_val, op, threshold_val))
+    if pre_fires:
+        return False, ("rule %s would fire in a known-good cluster "
+                       "(pre-injection value=%s threshold=%s %s) — "
+                       "decorative / always-fires" %
+                       (rule_title, pre_val, op, threshold_val))
+
+    # Inject failure and wait for the metric to actually flip in Prometheus
+    # (one scrape interval, typically 15-30s).
+    snapshot = _snapshot_persistence_config(pod)
+    try:
+        _inject_persistence_failure(pod)
+        _wait_for_metric_value("redis_aof_enabled", 0, timeout=60)
+        # One extra second of polling so the latest scrape lands and the
+        # instant query reflects the post-injection value.
+        time.sleep(2)
+        post_val = _prom_instant_value(expr)
+        post_fires = _evaluate_threshold(op, threshold_val, post_val)
+        if post_fires is None:
+            return False, ("could not evaluate rule %s post-injection "
+                           "(expr=%r value=%r threshold=%s %s)" %
+                           (rule_title, expr, post_val, op, threshold_val))
+        if post_fires:
+            return True, ("rule %s transitioned (pre=%s post=%s threshold=%s %s)"
+                          % (rule_title, pre_val, post_val, op, threshold_val))
+        return False, ("rule %s did not fire under injection "
+                       "(pre=%s post=%s threshold=%s %s) — "
+                       "expression does not respond to the failure" %
+                       (rule_title, pre_val, post_val, op, threshold_val))
+    finally:
+        _restore_persistence_config(pod, snapshot)
+
+
 def subscore_b_alert_observability():
-    """AND-gate of 2 checks, isolated from A so subscore independence holds:
-      b1 alert_rule_loaded                  — rule exists with accepted metric.
-      b2 alert_fires_on_synthetic_failure   — behavioral; inject + poll alerts
-                                              in a controlled cluster state
-                                              (reverters suspended, sidecar
-                                              quiesced, sts patched to known
-                                              good). Restored in finally.
+    """AND-gate of 2 checks, isolated from A so subscore independence holds.
+    Path-store-agnostic: accepts rules from Prometheus rule_files or from
+    Grafana UnifiedAlerting provisioning.
+      b1 alert_rule_loaded                  — rule exists with accepted metric
+                                              in EITHER store.
+      b2 alert_fires_on_synthetic_failure   — behavioral; dispatches on rule
+                                              source (Prometheus polls alerts
+                                              API, Grafana evaluates threshold
+                                              against live metric).
     """
-    rule, metric, err = _find_matching_alert_rule()
+    rule, metric, source, err = _find_matching_alert_rule()
     b1_ok = rule is not None
-    b1_detail = ("matched " + (rule.get("name", "?") if rule else "?")
-                 + " on metric " + (metric or "?")) if b1_ok else (err or "no rule")
+    if b1_ok:
+        if source == "prometheus":
+            rule_label = rule.get("name", "?")
+        else:
+            rule_label = rule.get("title") or rule.get("uid") or "?"
+        b1_detail = ("matched %s [%s] on metric %s" %
+                     (rule_label, source, metric or "?"))
+    else:
+        b1_detail = err or "no rule"
 
     isolation_state = None
     try:
         isolation_state, pod = _isolate_cluster_for_b2()
 
-        # b2: BEHAVIORAL — verify the alert TRANSITIONS from inactive to
-        # pending/firing under synthetic injection, in a known-good cluster.
-        # Pre-state gate catches always-firing decorative alerts; post-
-        # injection poll catches stuck-off alerts. Independent of A because
-        # the isolation reset the cluster persistence state regardless of
-        # how A's reverters were left.
         if not rule:
             b2_ok = False
             b2_detail = "no rule to test (b1 failed)"
@@ -575,33 +835,10 @@ def subscore_b_alert_observability():
             b2_ok = False
             b2_detail = ("could not bring redis to known-good state for b2 "
                          "(isolation setup failed)")
+        elif source == "prometheus":
+            b2_ok, b2_detail = _b2_prometheus_path(rule, pod)
         else:
-            rule_name = rule.get("name", "")
-            pre_state = _current_alert_state(rule_name)
-            if pre_state == "unknown":
-                b2_ok = False
-                b2_detail = ("could not determine pre-injection alert state "
-                             "(prometheus /api/v1/alerts unavailable)")
-            elif pre_state in ("pending", "firing"):
-                b2_ok = False
-                b2_detail = ("alert %s was already %s in a known-good cluster "
-                             "(decorative / always-fires rule)" %
-                             (rule_name, pre_state))
-            else:
-                snapshot = _snapshot_persistence_config(pod)
-                try:
-                    _inject_persistence_failure(pod)
-                    fired, state = _poll_alert_pending_or_firing(rule_name, timeout=60)
-                    b2_ok = fired
-                    b2_detail = (
-                        ("alert %s transitioned %s -> %s under injection" %
-                         (rule_name, pre_state, state))
-                        if fired else
-                        "alert %s did not transition out of %s within 60s "
-                        "of synthetic failure injection" % (rule_name, pre_state)
-                    )
-                finally:
-                    _restore_persistence_config(pod, snapshot)
+            b2_ok, b2_detail = _b2_grafana_path(rule, pod)
     finally:
         _restore_cluster_after_b2(isolation_state)
 
