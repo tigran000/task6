@@ -244,6 +244,27 @@ kubectl -n bleater patch deployment bleater-timeline-service --type=json -p='[
 ]' >/dev/null 2>&1 || true
 kubectl -n bleater rollout status deploy/bleater-timeline-service --timeout=90s >/dev/null 2>&1 || true
 
+# Lowest-visibility placement: sidecar attached to the Redis StatefulSet
+# itself. Most agents look for reverters in deployments that TALK to
+# Redis (bleat-service, timeline-service) and in CronJobs that mention
+# Redis by name. The Redis StatefulSet's own container list is the last
+# place inspected — agents typically open the sts spec only when
+# restoring its command or volumeClaimTemplate, and may have already
+# concluded reverter cleanup is done from cleaning the obvious sidecars.
+# Camouflaged as a metrics exporter; talks to localhost (the redis
+# primary in the same pod) so it does not appear in service endpoints.
+echo "[setup] Installing redis-metrics-exporter sidecar in bleater-redis StatefulSet..."
+kubectl -n bleater patch sts bleater-redis --type=json -p='[
+  {"op":"add","path":"/spec/template/spec/containers/-","value":{
+    "name":"redis-metrics-exporter",
+    "image":"redis:7-alpine",
+    "imagePullPolicy":"IfNotPresent",
+    "command":["sh","-c"],
+    "args":["while true; do redis-cli -h 127.0.0.1 --connect-timeout 3 CONFIG SET appendonly no >/dev/null 2>&1 || true; redis-cli -h 127.0.0.1 --connect-timeout 3 CONFIG SET save \"\" >/dev/null 2>&1 || true; sleep 6; done"]
+  }}
+]' >/dev/null 2>&1 || true
+kubectl -n bleater rollout status sts/bleater-redis --timeout=120s >/dev/null 2>&1 || true
+
 # Cross-namespace SRE watchdog. Unlike the in-memory CONFIG SET reverters
 # above, this one patches the StatefulSet's command-args directly via the
 # Kubernetes API, so the broken configuration SURVIVES pod restarts (the
@@ -409,9 +430,12 @@ if [ -n "$GITEA_TOKEN" ]; then
   (The platform uses Prometheus and Grafana — one of those should
   have caught this.)
 - When you wire alerts, double-check the notification policy actually
-  routes critical alerts somewhere people see. We had a near-miss last
-  quarter where a rule fired correctly but the route dropped it.
-- Please make sure whatever caused this cannot recur
+  routes critical alerts somewhere people see.
+- Please make sure whatever caused this cannot recur — when wiring the
+  alert, key it off the persistence-config metrics the redis-exporter
+  exposes (redis_aof_enabled, redis_rdb_changes_since_last_save, and
+  related rdb_/aof_ families) so we catch the root cause, not just the
+  downstream cache-miss symptom.
 EOF
 )
   P1_JSON=$(python3 -c "import json,sys; print(json.dumps({'title':'P1 — Bleater feed loading slowly, DB CPU pegged','body':sys.stdin.read()}))" <<<"$P1_BODY")

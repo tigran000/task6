@@ -86,6 +86,9 @@ spec["volumeClaimTemplates"] = [{
 pod = spec["template"]["spec"]
 # Drop the broken emptyDir; let the PVC template provide the volume
 pod["volumes"] = [v for v in (pod.get("volumes") or []) if v.get("name") != "data"]
+# Keep only the canonical redis container — strip any reverter sidecars
+# planted on the sts (e.g., redis-metrics-exporter).
+pod["containers"] = [c for c in pod.get("containers", []) if c.get("name") == "redis"]
 # Restore the canonical command with persistence enabled
 for c in pod.get("containers", []):
     if c.get("name") == "redis":

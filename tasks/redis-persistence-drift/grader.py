@@ -4,7 +4,7 @@ Two equal-weight, binary, orthogonal subscores. Each is an AND-gate of two
 related but independent checks. Within-subscore checks share a theme;
 between-subscore checks are independent code paths.
 
-  A persistence_durability  (weight 0.5)
+  A persistence_durability  (weight 0.5)  — AND-gate of 3 atoms.
       a1 baseline_survives_restart
          STRING key with manual BGSAVE+BGREWRITEAOF, force-delete the pod,
          and GET it back. Also asserts /data is on a persistentVolumeClaim
@@ -14,29 +14,39 @@ between-subscore checks are independent code paths.
          redis-config-watchdog) is still alive and has flipped the sts
          to `--appendonly no` and `--save ""`, the new pod loads from
          RDB but writes after the last BGSAVE are lost on the next cycle.
-      a3 no_live_reverter_undoing_config  (BEHAVIORAL)
-         Probes for live in-app reverters by writing a known-good value
-         (`CONFIG SET appendonly yes`), waiting through the 5-7s reverter-
-         loop window, and reading back. Any sidecar/cronjob still
-         actively reverting the config flips the value within the window
-         and the check fails. Single behavioral probe — no list-bundling,
-         no name match, no static YAML inspection. Catches reverters in
-         any pod / any deployment / any namespace, including renames.
+      a3 no_reverter_sidecar_in_bleat_service  (BEHAVIOR-BASED SPEC AUDIT)
+         Per-resource scan of _REVERTER_SIDECAR_RESOURCES — Deployments,
+         the bleater-redis StatefulSet, and CronJob templates across both
+         the bleater and monitoring namespaces. Each container's
+         command/args is matched against two reverter-shaped patterns:
+         redis-cli CONFIG SET disabling persistence, and kubectl-patch
+         loops flipping the bleater-redis sts command-args back. Catches
+         quiesced reverters (CronJob spec.suspend=true, scale-to-0,
+         host-Deployment rolled) the live poll misses, AND reverters
+         planted on the Redis sts itself (added in v31).
+      a3 no_live_reverter_undoing_config  (BEHAVIORAL, POLLED)
+         `CONFIG SET appendonly yes`, then poll up to 30s for a flip with
+         early-exit. Any actively-running reverter in any pod / any
+         namespace flips the value within the window. Catches reverters
+         from sources the spec audit doesn't scan (CronJob templates,
+         daemonsets, external pods). The two a3 atoms compose to
+         "nothing — live or in spec — is undoing the config".
 
-  B alert_observability     (weight 0.5)
+  B alert_observability     (weight 0.5)  — AND-gate of 3 atoms.
+      b1 alert_rule_loaded
+         Three-store rule discovery (Prometheus /api/v1/rules, Grafana
+         file-provisioning CM, Grafana runtime API). Reports the matched
+         rule and metric. b2 and b3 cascade to "no rule to test" if b1
+         fails, preserving cascade semantics without collapsing two
+         distinct skills (rule discovery + rule firing) into one atom.
       b2 alert_fires_on_synthetic_failure  (BEHAVIORAL)
-         Discovers a rule referencing a redis-exporter persistence metric
-         in any of three stores (Prometheus /api/v1/rules, Grafana file-
-         provisioning CM, Grafana runtime API), runs it inside isolation
-         (suspend reverters, scale bleat-service to 0, patch sts to
-         known-good, wait for redis_aof_enabled=1), injects a synthetic
-         failure, and asserts state transition (inactive→pending/firing
-         for Prometheus rules; threshold-eval pre/post-injection for
-         Grafana rules). The pre-state gate catches decorative always-
-         firing rules; the post-injection check catches stuck-off rules.
-         No-rule-found is reported as a behavioral failure ("no rule to
-         test"), so this single check subsumes "rule exists" + "rule
-         fires" without a separate static presence atom.
+         Runs the discovered rule inside isolation (suspend reverters,
+         scale bleat-service to 0, patch sts to known-good, wait for
+         redis_aof_enabled=1), injects a synthetic failure, and asserts
+         state transition (inactive→pending/firing for Prometheus rules;
+         threshold-eval pre/post-injection for Grafana rules). The pre-
+         state gate catches decorative always-firing rules; the post-
+         injection check catches stuck-off rules.
       b3 alert_routes_to_pageable_receiver  (BEHAVIORAL, NON-DESTRUCTIVE)
          Walks Grafana's notification policy tree top-down against the
          matched rule's labels (curl /api/v1/provisioning/policies from
@@ -167,55 +177,174 @@ def _data_mount_is_pvc(pod_name):
     return False
 
 
-# v30 a3 is behavioral: instead of inspecting Deployment YAML for reverter-
-# shaped containers (static config check that the rubric flagged as
-# Functional-Tests-as-Subscores violation AND No-Binary-Bundling violation
-# when it AND-gated multiple deployments), the grader actively probes for
-# live reverter behavior. It writes a known-good value into Redis, waits
-# long enough for any 5-7s reverter loop to fire several times, then reads
-# back. If anything is still actively reverting the config (in ANY pod,
-# in ANY namespace, regardless of name or location), the value flips and
-# a3 fails. Single behavioral check, no list-bundling, no name match.
-_A3_PROBE_WINDOW_SECONDS = 30
+# Resources where setup.sh plants reverters. The a3 spec audit visits
+# every entry; agents must clean ALL of them. Tuple = (kind, name,
+# namespace). Resources of kind "cronjob" are caught even when suspended
+# (suspending preserves the spec, so a reverter-shaped container in the
+# jobTemplate still indicates the reverter is one Suspend=false away
+# from running). "absent" status (resource entirely deleted) counts as
+# PASS for that entry — full deletion is the strongest cleanup. Adding
+# bleater-redis catches sidecars planted on the Redis sts itself, which
+# the v25-v29 audit missed.
+_REVERTER_SIDECAR_RESOURCES = [
+    ("deploy", "bleater-bleat-service", NS),
+    ("deploy", "bleater-timeline-service", NS),
+    ("sts", "bleater-redis", NS),
+    ("cronjob", "cache-config-syncer", NS),
+    ("cronjob", "redis-fsync-tuner", PROM_NS),
+    ("cronjob", "redis-config-watchdog", PROM_NS),
+]
+
+
+def _resource_containers(kind, name, namespace):
+    """Return the list of container dicts inside the named resource's
+    pod template. Handles Deployment / StatefulSet (containers under
+    .spec.template.spec.containers) and CronJob (containers under
+    .spec.jobTemplate.spec.template.spec.containers). Returns:
+      list[dict] — the containers
+      "absent"   — resource is fully deleted (PASS for the audit)
+      None       — resource exists but couldn't be parsed (audit-fail)"""
+    rc, out, _ = run(
+        ["kubectl", "-n", namespace, "get", kind, name, "-o", "json"],
+        timeout=15,
+    )
+    out = (out or "").strip()
+    if rc != 0 or not out:
+        return "absent"
+    try:
+        d = json.loads(out)
+    except Exception:
+        return None
+    if kind == "cronjob":
+        pod_spec = (d.get("spec", {})
+                     .get("jobTemplate", {})
+                     .get("spec", {})
+                     .get("template", {})
+                     .get("spec", {}))
+    else:
+        pod_spec = (d.get("spec", {})
+                     .get("template", {})
+                     .get("spec", {}))
+    return pod_spec.get("containers", [])
+
+
+def _is_reverter_shaped(container):
+    """Behavior-based detection of a reverter container. Catches both:
+      A. redis-cli CONFIG SET loops disabling persistence (appendonly no,
+         appendfsync no, save "")
+      B. kubectl patch loops flipping the bleater-redis StatefulSet
+         command-args back to a non-durable state (the redis-config-
+         watchdog mechanism)
+    Behavior-based so renames don't bypass."""
+    parts = (container.get("command") or []) + (container.get("args") or [])
+    joined = " ".join(parts).lower()
+    # Pattern A: redis-cli CONFIG SET disabling persistence.
+    if "config set" in joined:
+        if "appendonly" in joined and " no" in joined:
+            return True
+        if "appendfsync" in joined and " no" in joined:
+            return True
+        # `CONFIG SET save ""` — the empty string survives .lower() as
+        # just two quotes; look for the disabling pattern directly.
+        if " save " in joined and ('""' in joined or "''" in joined):
+            return True
+    # Pattern B: kubectl patch on the bleater-redis StatefulSet that
+    # flips its command-args back to a non-durable state.
+    if ("kubectl" in joined and "patch" in joined and
+            ("statefulset" in joined or " sts " in joined) and
+            "bleater-redis" in joined):
+        if "appendonly" in joined and "no" in joined:
+            return True
+        if " save " in joined and ('""' in joined or "''" in joined):
+            return True
+    return False
+
+
+def _a3_spec_audit_no_reverter_sidecar():
+    """Behavior-based spec audit across Deployments, StatefulSets, and
+    CronJob templates. For each entry in _REVERTER_SIDECAR_RESOURCES,
+    fetch the live spec and fail if ANY container in the pod template
+    looks like a reverter. Resources entirely deleted count as PASS.
+    Catches:
+      - quiesced reverters (CronJob spec.suspend=true) the live poll misses
+      - reverters planted on the Redis sts itself (added in v31 — the
+        previous Deployment-only audit was blind to this placement)
+      - kubectl-patch-shaped watchdog containers (catches redis-config-
+        watchdog in its CronJob jobTemplate)
+    """
+    per_resource = []
+    overall_bad = []
+    unreadable = []
+    for kind, name, namespace in _REVERTER_SIDECAR_RESOURCES:
+        containers = _resource_containers(kind, name, namespace)
+        if containers is None:
+            unreadable.append("%s/%s in %s" % (kind, name, namespace))
+            continue
+        if containers == "absent":
+            per_resource.append((kind, name, namespace, "absent", []))
+            continue
+        reverter_names = [c.get("name", "?") for c in containers
+                          if _is_reverter_shaped(c)]
+        all_names = [c.get("name", "?") for c in containers]
+        per_resource.append((kind, name, namespace, all_names, reverter_names))
+        if reverter_names:
+            overall_bad.append((kind, name, namespace, reverter_names))
+    if unreadable:
+        return False, ("could not parse spec for resource(s): %s" % unreadable)
+    if overall_bad:
+        return False, ("reverter-shaped container(s) still present: %s" %
+                       [(k, n, ns, names) for k, n, ns, names in overall_bad])
+    return True, ("no reverter-shaped container in any audited resource "
+                  "(%s)" % [(k, n, ns) for k, n, ns, _, _ in per_resource])
+
+
+# Behavioral live-poll: catches reverters that are currently running in
+# any pod / any namespace, regardless of where they live or what they're
+# named. Complements the spec audit above — the spec audit catches
+# quiesced reverters the live poll misses, and the live poll catches
+# reverters from sources the spec audit doesn't scan (CronJob templates,
+# daemonsets, external pods).
+_A3_POLL_DEADLINE_SECONDS = 30
+_A3_POLL_TICK_SECONDS = 2
 _A3_PROBE_KEY = "appendonly"
 _A3_PROBE_GOOD_VALUE = "yes"
 
 
-def _a3_no_live_reverter(pod):
-    """Behavioral probe for live reverters. Returns (ok, detail)."""
+def _a3_live_poll_no_reverter(pod):
+    """Behavioral probe with polling + early-exit. Drive Redis's appendonly
+    to a known-good value, then poll until it either flips (live reverter
+    caught) or the deadline expires (no live reverter detected). Returns
+    (ok, detail)."""
     if not pod:
-        return False, "no redis pod available for a3 probe"
-    # Drive the runtime config to the known-good state.
+        return False, "no redis pod available for a3 live-poll"
     redis_cli(pod, "CONFIG", "SET", _A3_PROBE_KEY, _A3_PROBE_GOOD_VALUE)
-    # Verify the set landed (sanity check — should always be true for a
-    # responsive Redis).
     out = redis_cli(pod, "CONFIG", "GET", _A3_PROBE_KEY)
     lines = out.splitlines()
     if len(lines) < 2 or lines[1].strip() != _A3_PROBE_GOOD_VALUE:
         return False, ("CONFIG SET %s %s did not land (got=%r)" %
                        (_A3_PROBE_KEY, _A3_PROBE_GOOD_VALUE, out))
-    # Wait long enough for any sidecar reverter on a 5-7s loop to fire
-    # at least 3-4 times.
-    time.sleep(_A3_PROBE_WINDOW_SECONDS)
-    # Re-read. If a reverter is alive in any pod hitting redis, the value
-    # has flipped.
-    out = redis_cli(pod, "CONFIG", "GET", _A3_PROBE_KEY)
-    lines = out.splitlines()
-    if len(lines) < 2:
-        return False, ("could not read %s back after probe window (out=%r)" %
-                       (_A3_PROBE_KEY, out))
-    val = lines[1].strip()
-    if val == _A3_PROBE_GOOD_VALUE:
-        return True, ("%s stable at %r for %ds — no live reverter detected" %
-                      (_A3_PROBE_KEY, _A3_PROBE_GOOD_VALUE,
-                       _A3_PROBE_WINDOW_SECONDS))
-    return False, ("%s flipped to %r within %ds — live reverter is undoing "
-                   "config (some sidecar/cronjob is still active)" %
-                   (_A3_PROBE_KEY, val, _A3_PROBE_WINDOW_SECONDS))
+    deadline = time.time() + _A3_POLL_DEADLINE_SECONDS
+    while time.time() < deadline:
+        time.sleep(_A3_POLL_TICK_SECONDS)
+        out = redis_cli(pod, "CONFIG", "GET", _A3_PROBE_KEY)
+        lines = out.splitlines()
+        if len(lines) < 2:
+            continue
+        val = lines[1].strip()
+        if val != _A3_PROBE_GOOD_VALUE:
+            return False, ("%s flipped to %r within %ds — live reverter is "
+                           "undoing config (some sidecar/cronjob is still "
+                           "active)" %
+                           (_A3_PROBE_KEY, val, _A3_POLL_DEADLINE_SECONDS))
+    return True, ("%s stable at %r for %ds — no live reverter detected" %
+                  (_A3_PROBE_KEY, _A3_PROBE_GOOD_VALUE,
+                   _A3_POLL_DEADLINE_SECONDS))
 
 
 def subscore_a_persistence_durability():
-    """AND-gate of 2 independent checks.
+    """AND-gate of 3 atoms. All three inspect Redis persistence/config
+    state, answering one coherent question: 'Is Redis durably persistent
+    AND nothing — live or in spec — is undoing it?'
     a1 baseline_survives_restart           — write+BGSAVE+BGREWRITEAOF, force-
                                               delete the pod, GET back. Also
                                               asserts /data is on a PVC. The
@@ -225,34 +354,46 @@ def subscore_a_persistence_durability():
                                               is still alive it will have
                                               flipped the command to
                                               `--save "" --appendonly no
-                                              --dir /tmp`. With `--dir /tmp`
-                                              the new pod can no longer find
-                                              the RDB file we BGSAVEd onto
-                                              the `/data` PVC, so the round-
-                                              trip fails. Agents must kill
+                                              --dir /tmp`. Agents must kill
                                               the watchdog AND its RBAC for
                                               this check to pass.
-    a3 no_live_reverter_undoing_config —
-                                              Behavioral probe. Sets a known-
-                                              good config value (CONFIG SET
-                                              appendonly yes), waits 30s
-                                              (long enough for 5-7s reverter
-                                              loops to fire 3-4 times), and
-                                              reads back. Any sidecar/cronjob
-                                              still actively reverting the
-                                              config in any pod/deployment/
-                                              namespace flips the value
-                                              within the window and the
-                                              check fails. Single behavioral
-                                              probe — no name match, no
-                                              static spec inspection, no
-                                              list-bundling across
-                                              deployments.
+    a3 no_reverter_sidecar_in_bleat_service — Behavior-based spec audit
+                                              across Deployments, the
+                                              bleater-redis StatefulSet,
+                                              and CronJob templates
+                                              (_REVERTER_SIDECAR_RESOURCES).
+                                              No container's command/args
+                                              may match a reverter
+                                              pattern (redis-cli CONFIG
+                                              SET disabling persistence
+                                              OR kubectl patch flipping
+                                              the redis sts command).
+                                              Catches quiesced reverters
+                                              (CronJob-suspended, scale-
+                                              to-0, host-Deployment
+                                              rolled) the live poll
+                                              misses, and reverters
+                                              planted on the Redis sts
+                                              itself.
+    a3 no_live_reverter_undoing_config     — Behavioral live-poll with
+                                              early-exit. CONFIG SET
+                                              appendonly yes, then poll
+                                              up to 30s for a flip. Any
+                                              actively-running reverter
+                                              in any pod / any namespace
+                                              flips the value within the
+                                              window. Catches reverters
+                                              from sources the spec audit
+                                              doesn't scan (CronJob
+                                              templates, daemonsets,
+                                              external pods).
     """
     pod = wait_for_redis(timeout=120)
     if not pod:
-        return [0, 0], [
+        return [0, 0, 0], [
             ("baseline_survives_restart", False, "no redis pre-probe"),
+            ("no_reverter_sidecar_in_bleat_service", False,
+             "redis unavailable; cannot validate cluster state"),
             ("no_live_reverter_undoing_config", False,
              "redis unavailable; cannot validate cluster state"),
         ]
@@ -281,19 +422,15 @@ def subscore_a_persistence_durability():
         a1_detail = ("round-trip + /data on PVC" if a1_ok else
                      "value_ok=%s pvc_mount=%s got=%r" % (a1_value_ok, a1_pvc_ok, a1_got))
 
-    # a3: behavioral probe for live reverters. Set Redis's appendonly to a
-    # known-good value, wait through the 5-7s reverter loop window, read
-    # back. Any sidecar/cronjob (in any pod, any namespace, regardless of
-    # name) actively reverting the config will flip the value within the
-    # window and we catch it. Replaces v27's static multi-deployment
-    # YAML audit (which the v29 rubrics flagged as both
-    # Functional-Tests-as-Subscores and No-Binary-Bundling violations).
-    probe_pod = redis_pod() if new_pod is None else new_pod
-    a3_ok, a3_detail = _a3_no_live_reverter(probe_pod)
+    a3_spec_ok, a3_spec_detail = _a3_spec_audit_no_reverter_sidecar()
 
-    return [int(a1_ok), int(a3_ok)], [
+    probe_pod = redis_pod() if new_pod is None else new_pod
+    a3_poll_ok, a3_poll_detail = _a3_live_poll_no_reverter(probe_pod)
+
+    return [int(a1_ok), int(a3_spec_ok), int(a3_poll_ok)], [
         ("baseline_survives_restart", a1_ok, a1_detail),
-        ("no_live_reverter_undoing_config", a3_ok, a3_detail),
+        ("no_reverter_sidecar_in_bleat_service", a3_spec_ok, a3_spec_detail),
+        ("no_live_reverter_undoing_config", a3_poll_ok, a3_poll_detail),
     ]
 
 
@@ -1082,16 +1219,23 @@ def _b2_grafana_path(rule, pod):
 
 
 def subscore_b_alert_observability():
-    """AND-gate of 2 checks, isolated from A so subscore independence holds.
+    """AND-gate of 3 atoms, isolated from A so subscore independence holds.
     Path-store-agnostic: accepts rules from Prometheus rule_files, Grafana
     file-provisioning ConfigMap, or Grafana runtime API.
-      b2 alert_fires_on_synthetic_failure       — behavioral; discovers the
-                                                  rule across all three
-                                                  stores then verifies it
-                                                  transitions under injection
-                                                  inside the v23 cluster
-                                                  isolation. No rule found →
-                                                  fails as "no rule to test".
+      b1 alert_rule_loaded                      — three-store rule discovery
+                                                  (Prometheus /api/v1/rules,
+                                                  Grafana file-provisioning
+                                                  CM, Grafana runtime API).
+                                                  Fails when no rule
+                                                  referencing an accepted
+                                                  persistence metric is
+                                                  loaded. b2/b3 cascade to
+                                                  "no rule to test" when
+                                                  b1 fails.
+      b2 alert_fires_on_synthetic_failure       — behavioral; verifies the
+                                                  discovered rule transitions
+                                                  under injection inside the
+                                                  cluster isolation harness.
       b3 alert_routes_to_pageable_receiver      — behavioral routing check;
                                                   walks Grafana notification
                                                   policies to confirm the
@@ -1101,21 +1245,22 @@ def subscore_b_alert_observability():
                                                   open (no Alertmanager).
     """
     rule, metric, source, err = _find_matching_alert_rule()
-    if rule is not None:
+    b1_ok = rule is not None
+    if b1_ok:
         if source == "prometheus":
             rule_label = rule.get("name", "?")
         else:
             rule_label = rule.get("title") or rule.get("uid") or "?"
-        rule_summary = "matched %s [%s] on metric %s" % (
-            rule_label, source, metric or "?")
+        b1_detail = ("matched %s [%s] on metric %s" %
+                     (rule_label, source, metric or "?"))
     else:
-        rule_summary = err or "no rule"
+        b1_detail = err or "no rule"
 
-    # b3 first — it's policy-config-only, no cluster mutation, cheap. Runs
-    # outside the isolation harness. If no rule was found, b3 cascades.
-    if rule is None:
+    # b3 first — policy-config-only, no cluster mutation, cheap. Runs
+    # outside the isolation harness. Cascades when b1 fails.
+    if not b1_ok:
         b3_ok = False
-        b3_detail = "no rule to test (no matching alert rule found in any store)"
+        b3_detail = "no rule to test (b1 failed)"
     else:
         b3_ok, b3_detail = _b3_route_is_pageable(rule, source)
 
@@ -1123,9 +1268,9 @@ def subscore_b_alert_observability():
     try:
         isolation_state, pod = _isolate_cluster_for_b2()
 
-        if not rule:
+        if not b1_ok:
             b2_ok = False
-            b2_detail = ("no rule to test — %s" % rule_summary)
+            b2_detail = "no rule to test (b1 failed)"
         elif not pod:
             b2_ok = False
             b2_detail = ("could not bring redis to known-good state for b2 "
@@ -1137,7 +1282,8 @@ def subscore_b_alert_observability():
     finally:
         _restore_cluster_after_b2(isolation_state)
 
-    return [int(b2_ok), int(b3_ok)], [
+    return [int(b1_ok), int(b2_ok), int(b3_ok)], [
+        ("alert_rule_loaded", b1_ok, b1_detail),
         ("alert_fires_on_synthetic_failure", b2_ok, b2_detail),
         ("alert_routes_to_pageable_receiver", b3_ok, b3_detail),
     ]
