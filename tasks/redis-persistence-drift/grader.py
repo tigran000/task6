@@ -71,7 +71,6 @@ import uuid
 NS = "bleater"
 PROM_NS = "monitoring"
 POD_LABEL = "app=bleater-redis"
-POD_NAME = "bleater-redis-0"
 KUBECTL = ["kubectl", "-n", NS]
 
 
