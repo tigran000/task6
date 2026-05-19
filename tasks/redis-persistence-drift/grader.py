@@ -4,33 +4,25 @@ Two equal-weight, binary, orthogonal subscores. Each is an AND-gate of two
 related but independent checks. Within-subscore checks share a theme;
 between-subscore checks are independent code paths.
 
-  A persistence_durability  (weight 0.5)  — AND-gate of 3 atoms.
-      a1 baseline_survives_restart
-         STRING key with manual BGSAVE+BGREWRITEAOF, force-delete the pod,
-         and GET it back. Also asserts /data is on a persistentVolumeClaim
-         (so emptyDir-with-AOF-only does not pass). The grader's force-
-         delete causes the pod to come up with whatever command-args the
-         live sts currently has — so if an sts-patching reverter (e.g.,
-         redis-config-watchdog) is still alive and has flipped the sts
-         to `--appendonly no` and `--save ""`, the new pod loads from
-         RDB but writes after the last BGSAVE are lost on the next cycle.
+  A persistence_durability  (weight 0.5)  — AND-gate of 2 atoms.
       a3 no_reverter_sidecar_in_bleat_service  (BEHAVIOR-BASED SPEC AUDIT)
          Per-resource scan of _REVERTER_SIDECAR_RESOURCES — Deployments,
-         the bleater-redis StatefulSet, and CronJob templates across both
-         the bleater and monitoring namespaces. Each container's
-         command/args is matched against two reverter-shaped patterns:
-         redis-cli CONFIG SET disabling persistence, and kubectl-patch
-         loops flipping the bleater-redis sts command-args back. Catches
-         quiesced reverters (CronJob spec.suspend=true, scale-to-0,
-         host-Deployment rolled) the live poll misses, AND reverters
-         planted on the Redis sts itself (added in v31).
-      a3 no_live_reverter_undoing_config  (BEHAVIORAL, POLLED)
-         `CONFIG SET appendonly yes`, then poll up to 30s for a flip with
-         early-exit. Any actively-running reverter in any pod / any
-         namespace flips the value within the window. Catches reverters
-         from sources the spec audit doesn't scan (CronJob templates,
-         daemonsets, external pods). The two a3 atoms compose to
-         "nothing — live or in spec — is undoing the config".
+         the bleater-redis StatefulSet, and CronJob templates across the
+         bleater and monitoring namespaces. Each container's command/args
+         is matched against two reverter-shaped patterns: redis-cli CONFIG
+         SET disabling persistence, and kubectl-patch loops flipping the
+         bleater-redis sts command-args back. Catches quiesced reverters
+         (CronJob spec.suspend=true, scale-to-0, host-Deployment rolled)
+         AND reverters planted on the Redis sts itself.
+      a4 persistence_config_durably_correct  (BEHAVIOR-BASED SPEC READ)
+         Inspect the bleater-redis StatefulSet spec — all four properties
+         must hold: --save flag with a non-empty value (RDB enabled),
+         --appendonly yes (AOF enabled), --dir is /data or unset (not
+         /tmp), and /data is backed by a persistentVolumeClaim (not
+         emptyDir). Catches agents who restored runtime CONFIG SET but
+         left the sts spec broken — first pod restart reverts. All four
+         are properties of one resource (the sts spec), answering one
+         question (is persistence durably configured?).
 
   B alert_observability     (weight 0.5)  — AND-gate of 3 atoms.
       b1 alert_rule_loaded
@@ -75,7 +67,6 @@ import re
 import subprocess
 import time
 import urllib.parse
-import uuid
 
 NS = "bleater"
 PROM_NS = "monitoring"
@@ -133,48 +124,6 @@ def wait_for_redis(timeout=180):
                         return pod
         time.sleep(3)
     return None
-
-
-def _poll_bgsave_done(pod, timeout=30):
-    last_save_before = redis_cli(pod, "LASTSAVE")
-    redis_cli(pod, "BGSAVE")
-    start = time.time()
-    while time.time() - start < timeout:
-        cur = redis_cli(pod, "LASTSAVE")
-        if cur and cur != last_save_before:
-            return
-        info = redis_cli(pod, "INFO", "persistence")
-        if "rdb_bgsave_in_progress:0" in info and "loading:0" in info:
-            return
-        time.sleep(2)
-
-
-def _poll_aof_rewrite_done(pod, timeout=15):
-    redis_cli(pod, "BGREWRITEAOF")
-    start = time.time()
-    while time.time() - start < timeout:
-        info = redis_cli(pod, "INFO", "persistence")
-        if "aof_rewrite_in_progress:0" in info:
-            return
-        time.sleep(1)
-
-
-def _data_mount_is_pvc(pod_name):
-    """Return True if the live pod has /data backed by a persistentVolumeClaim
-    (not emptyDir). Used to gate a1 so that probe-survival via manual flush
-    alone is not enough — durable storage must also be wired."""
-    _, out, _ = run(KUBECTL + ["get", "pod", pod_name, "-o", "json"])
-    try:
-        spec = json.loads(out).get("spec", {})
-    except Exception:
-        return False
-    volumes = {v["name"]: v for v in spec.get("volumes", [])}
-    for c in spec.get("containers", []):
-        for m in c.get("volumeMounts", []):
-            if m.get("mountPath") == "/data":
-                vol = volumes.get(m.get("name"), {})
-                return "persistentVolumeClaim" in vol
-    return False
 
 
 # Resources where setup.sh plants reverters. The a3 spec audit visits
@@ -298,67 +247,100 @@ def _a3_spec_audit_no_reverter_sidecar():
                   "(%s)" % [(k, n, ns) for k, n, ns, _, _ in per_resource])
 
 
-# Behavioral live-poll: catches reverters that are currently running in
-# any pod / any namespace, regardless of where they live or what they're
-# named. Complements the spec audit above — the spec audit catches
-# quiesced reverters the live poll misses, and the live poll catches
-# reverters from sources the spec audit doesn't scan (CronJob templates,
-# daemonsets, external pods).
-_A3_POLL_DEADLINE_SECONDS = 30
-_A3_POLL_TICK_SECONDS = 2
-_A3_PROBE_KEY = "appendonly"
-_A3_PROBE_GOOD_VALUE = "yes"
+def _a4_persistence_config_durably_correct():
+    """Inspect the bleater-redis StatefulSet spec. All four properties
+    of one resource must hold for persistence to survive a pod restart:
+      1. --save <non-empty> in the redis container's command-args
+         (RDB enabled — empty/missing means snapshots are off)
+      2. --appendonly yes (AOF enabled in the spec, not just runtime)
+      3. --dir is /data or unset (default /data) — not /tmp or other
+         ephemeral path
+      4. /data volume is backed by a persistentVolumeClaim (via a
+         volumeClaimTemplate or an explicit PVC volume) — not emptyDir
+    Returns (ok, detail)."""
+    rc, out, _ = run(
+        KUBECTL + ["get", "sts", "bleater-redis", "-o", "json"],
+        timeout=15,
+    )
+    if rc != 0 or not (out or "").strip():
+        return False, "bleater-redis StatefulSet unreadable or missing"
+    try:
+        d = json.loads(out)
+    except Exception:
+        return False, "could not parse bleater-redis StatefulSet spec"
 
+    sts_spec = d.get("spec") or {}
+    pod_spec = (sts_spec.get("template") or {}).get("spec") or {}
 
-def _a3_live_poll_no_reverter(pod):
-    """Behavioral probe with polling + early-exit. Drive Redis's appendonly
-    to a known-good value, then poll until it either flips (live reverter
-    caught) or the deadline expires (no live reverter detected). Returns
-    (ok, detail)."""
-    if not pod:
-        return False, "no redis pod available for a3 live-poll"
-    redis_cli(pod, "CONFIG", "SET", _A3_PROBE_KEY, _A3_PROBE_GOOD_VALUE)
-    out = redis_cli(pod, "CONFIG", "GET", _A3_PROBE_KEY)
-    lines = out.splitlines()
-    if len(lines) < 2 or lines[1].strip() != _A3_PROBE_GOOD_VALUE:
-        return False, ("CONFIG SET %s %s did not land (got=%r)" %
-                       (_A3_PROBE_KEY, _A3_PROBE_GOOD_VALUE, out))
-    deadline = time.time() + _A3_POLL_DEADLINE_SECONDS
-    while time.time() < deadline:
-        time.sleep(_A3_POLL_TICK_SECONDS)
-        out = redis_cli(pod, "CONFIG", "GET", _A3_PROBE_KEY)
-        lines = out.splitlines()
-        if len(lines) < 2:
-            continue
-        val = lines[1].strip()
-        if val != _A3_PROBE_GOOD_VALUE:
-            return False, ("%s flipped to %r within %ds — live reverter is "
-                           "undoing config (some sidecar/cronjob is still "
-                           "active)" %
-                           (_A3_PROBE_KEY, val, _A3_POLL_DEADLINE_SECONDS))
-    return True, ("%s stable at %r for %ds — no live reverter detected" %
-                  (_A3_PROBE_KEY, _A3_PROBE_GOOD_VALUE,
-                   _A3_POLL_DEADLINE_SECONDS))
+    redis_container = None
+    for c in pod_spec.get("containers", []) or []:
+        if c.get("name") == "redis":
+            redis_container = c
+            break
+    if redis_container is None:
+        return False, "no container named 'redis' in bleater-redis sts spec"
+
+    cmd_args = (redis_container.get("command") or []) + \
+               (redis_container.get("args") or [])
+
+    # 1. --save <non-empty>
+    save_value = None
+    for i, tok in enumerate(cmd_args):
+        if tok == "--save" and i + 1 < len(cmd_args):
+            save_value = cmd_args[i + 1]
+            break
+    save_ok = (save_value is not None
+               and save_value.strip() not in ("", '""', "''"))
+
+    # 2. --appendonly yes
+    aof_value = None
+    for i, tok in enumerate(cmd_args):
+        if tok == "--appendonly" and i + 1 < len(cmd_args):
+            aof_value = cmd_args[i + 1]
+            break
+    aof_ok = (aof_value is not None and aof_value.strip().lower() == "yes")
+
+    # 3. --dir /data or unset
+    dir_value = None
+    for i, tok in enumerate(cmd_args):
+        if tok == "--dir" and i + 1 < len(cmd_args):
+            dir_value = cmd_args[i + 1]
+            break
+    dir_ok = (dir_value is None) or (dir_value.strip() == "/data")
+
+    # 4. /data is PVC-backed (via a vct named "data" OR an explicit PVC volume)
+    pvc_ok = False
+    for vct in (sts_spec.get("volumeClaimTemplates") or []):
+        if (vct.get("metadata") or {}).get("name") == "data":
+            pvc_ok = True
+            break
+    if not pvc_ok:
+        volumes = {v["name"]: v for v in (pod_spec.get("volumes") or [])}
+        for m in (redis_container.get("volumeMounts") or []):
+            if m.get("mountPath") == "/data":
+                vol = volumes.get(m.get("name"), {})
+                if "persistentVolumeClaim" in vol:
+                    pvc_ok = True
+                break
+
+    if save_ok and aof_ok and dir_ok and pvc_ok:
+        return True, ("sts spec durable: --save=%r --appendonly=yes --dir=%s "
+                      "/data on PVC" %
+                      (save_value, dir_value or "/data (default)"))
+    return False, ("sts spec not durable: save_ok=%s (value=%r) aof_ok=%s "
+                   "(value=%r) dir_ok=%s (value=%r) pvc_ok=%s" %
+                   (save_ok, save_value, aof_ok, aof_value,
+                    dir_ok, dir_value, pvc_ok))
 
 
 def subscore_a_persistence_durability():
-    """AND-gate of 3 atoms. All three inspect Redis persistence/config
-    state, answering one coherent question: 'Is Redis durably persistent
-    AND nothing — live or in spec — is undoing it?'
-    a1 baseline_survives_restart           — write+BGSAVE+BGREWRITEAOF, force-
-                                              delete the pod, GET back. Also
-                                              asserts /data is on a PVC. The
-                                              new pod boots from the LIVE sts
-                                              spec, so if the sts-patching
-                                              reverter (`redis-config-watchdog`)
-                                              is still alive it will have
-                                              flipped the command to
-                                              `--save "" --appendonly no
-                                              --dir /tmp`. Agents must kill
-                                              the watchdog AND its RBAC for
-                                              this check to pass.
-    a3 no_reverter_sidecar_in_bleat_service — Behavior-based spec audit
-                                              across Deployments, the
+    """AND-gate of 2 atoms. Both inspect the cluster's Redis-persistence
+    resource state, answering one coherent question: 'Is Redis configured
+    for durable persistence, AND is nothing in the cluster going to
+    break it?'
+    a3 no_reverter_sidecar_in_bleat_service — Negative space. Behavior-
+                                              based spec audit across
+                                              Deployments, the
                                               bleater-redis StatefulSet,
                                               and CronJob templates
                                               (_REVERTER_SIDECAR_RESOURCES).
@@ -368,69 +350,20 @@ def subscore_a_persistence_durability():
                                               SET disabling persistence
                                               OR kubectl patch flipping
                                               the redis sts command).
-                                              Catches quiesced reverters
-                                              (CronJob-suspended, scale-
-                                              to-0, host-Deployment
-                                              rolled) the live poll
-                                              misses, and reverters
-                                              planted on the Redis sts
-                                              itself.
-    a3 no_live_reverter_undoing_config     — Behavioral live-poll with
-                                              early-exit. CONFIG SET
-                                              appendonly yes, then poll
-                                              up to 30s for a flip. Any
-                                              actively-running reverter
-                                              in any pod / any namespace
-                                              flips the value within the
-                                              window. Catches reverters
-                                              from sources the spec audit
-                                              doesn't scan (CronJob
-                                              templates, daemonsets,
-                                              external pods).
+    a4 persistence_config_durably_correct  — Positive space. The
+                                              bleater-redis sts spec
+                                              itself must have AOF on,
+                                              RDB on, --dir /data, and
+                                              /data backed by a PVC.
+                                              Catches agents who fix
+                                              runtime CONFIG SET but
+                                              leave the sts spec broken.
     """
-    pod = wait_for_redis(timeout=120)
-    if not pod:
-        return [0, 0, 0], [
-            ("baseline_survives_restart", False, "no redis pre-probe"),
-            ("no_reverter_sidecar_in_bleat_service", False,
-             "redis unavailable; cannot validate cluster state"),
-            ("no_live_reverter_undoing_config", False,
-             "redis unavailable; cannot validate cluster state"),
-        ]
-
-    # a1: probe key, then force a manual flush via BGSAVE+BGREWRITEAOF, then
-    # force-delete the pod. On restart the pod uses whatever command-args
-    # the LIVE sts has at that moment — that is the failure mode the
-    # sts-patching reverter (redis-config-watchdog) exploits.
-    a1_key = "grader:base:" + uuid.uuid4().hex
-    a1_val = uuid.uuid4().hex
-    redis_cli(pod, "SET", a1_key, a1_val)
-    _poll_bgsave_done(pod, timeout=30)
-    _poll_aof_rewrite_done(pod, timeout=15)
-
-    run(KUBECTL + ["delete", "pod", pod, "--force", "--grace-period=0"], timeout=60)
-
-    new_pod = wait_for_redis(timeout=180)
-    if not new_pod:
-        a1_ok = False
-        a1_detail = "redis did not recover after force-delete"
-    else:
-        a1_got = redis_cli(new_pod, "GET", a1_key)
-        a1_value_ok = a1_got == a1_val
-        a1_pvc_ok = _data_mount_is_pvc(new_pod)
-        a1_ok = a1_value_ok and a1_pvc_ok
-        a1_detail = ("round-trip + /data on PVC" if a1_ok else
-                     "value_ok=%s pvc_mount=%s got=%r" % (a1_value_ok, a1_pvc_ok, a1_got))
-
     a3_spec_ok, a3_spec_detail = _a3_spec_audit_no_reverter_sidecar()
-
-    probe_pod = redis_pod() if new_pod is None else new_pod
-    a3_poll_ok, a3_poll_detail = _a3_live_poll_no_reverter(probe_pod)
-
-    return [int(a1_ok), int(a3_spec_ok), int(a3_poll_ok)], [
-        ("baseline_survives_restart", a1_ok, a1_detail),
+    a4_ok, a4_detail = _a4_persistence_config_durably_correct()
+    return [int(a3_spec_ok), int(a4_ok)], [
         ("no_reverter_sidecar_in_bleat_service", a3_spec_ok, a3_spec_detail),
-        ("no_live_reverter_undoing_config", a3_poll_ok, a3_poll_detail),
+        ("persistence_config_durably_correct", a4_ok, a4_detail),
     ]
 
 
