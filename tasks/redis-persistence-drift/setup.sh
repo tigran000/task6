@@ -431,11 +431,11 @@ if [ -n "$GITEA_TOKEN" ]; then
   have caught this.)
 - When you wire alerts, double-check the notification policy actually
   routes critical alerts somewhere people see.
-- Please make sure whatever caused this cannot recur — when wiring the
-  alert, key it off the persistence-config metrics the redis-exporter
-  exposes (redis_aof_enabled, redis_rdb_changes_since_last_save, and
-  related rdb_/aof_ families) so we catch the root cause, not just the
-  downstream cache-miss symptom.
+- Please make sure whatever caused this cannot recur.
+- Cleanup should leave the cluster in a clean state — please delete
+  deprecated workloads outright rather than scaling them to zero or
+  suspending them, otherwise the next on-call inherits a confusing
+  topology.
 EOF
 )
   P1_JSON=$(python3 -c "import json,sys; print(json.dumps({'title':'P1 — Bleater feed loading slowly, DB CPU pegged','body':sys.stdin.read()}))" <<<"$P1_BODY")
