@@ -405,7 +405,9 @@ if [ -n "$GITEA_TOKEN" ]; then
 ### Notes
 - We had no alerting on this layer at all and got blindsided. We need
   to learn about regressions like this from a page, not from user
-  complaints — please make sure on-call gets notified next time
+  complaints — please make sure on-call gets notified next time.
+  (The platform uses Prometheus and Grafana — one of those should
+  have caught this.)
 - Please make sure whatever caused this cannot recur
 EOF
 )

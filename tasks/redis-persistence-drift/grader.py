@@ -24,15 +24,18 @@ between-subscore checks are independent code paths.
 
   B alert_observability     (weight 0.5)
       b1 alert_rule_loaded
-         Path-store-agnostic. Accepts EITHER (i) an alerting rule
-         loaded by Prometheus via /api/v1/rules whose expr references a
-         redis-exporter persistence metric, OR (ii) a Grafana
-         UnifiedAlerting rule provisioned through the cluster's
-         `monitoring/grafana-alerting-provisioning` ConfigMap whose
-         primary prometheus-data-source `model.expr` references the
-         same metric set. Tests the realistic capability ("wire an
-         alert visible to the platform's monitoring stack"), not the
-         meta-capability ("guess which store the grader prefers").
+         Path-store-agnostic across THREE stores. Accepts any of:
+           (i) Prometheus /api/v1/rules — file-based rule_files config.
+           (ii) Grafana file-provisioning ConfigMap
+                `monitoring/grafana-alerting-provisioning` (alert-rules.yaml).
+           (iii) Grafana runtime API
+                 `/api/v1/provisioning/alert-rules` — picks up rules created
+                 via POST with X-Disable-Provenance: true that never land in
+                 (ii). Default cluster auth is admin/admin.
+         Any rule whose primary prometheus expression references the
+         redis-exporter persistence metric whitelist passes. Tests the
+         realistic capability ("wire an alert visible to the platform's
+         monitoring stack"), not "guess which store the grader prefers."
       b2 alert_fires_on_synthetic_failure  (BEHAVIORAL)
          Same isolation as v23: suspend reverters, scale bleat-service
          to 0, patch sts to known-good, wait for redis_aof_enabled=1.
@@ -466,18 +469,82 @@ def _find_matching_grafana_rule():
     return None, None, "no Grafana rule references a redis-exporter persistence metric"
 
 
+def _read_grafana_api_rules():
+    """Read Grafana's runtime alert-rule store via
+    /api/v1/provisioning/alert-rules. This catches rules an agent created
+    via the Grafana API (e.g., `POST /api/v1/provisioning/alert-rules`
+    with `X-Disable-Provenance: true`) — those land in Grafana's runtime
+    DB but NOT in the file-provisioning ConfigMap, so they are invisible
+    to `_read_grafana_provisioned_rules`. v25 run1's agent did exactly
+    this and was unfairly rejected by b1.
+
+    Authentication: default cluster credentials are admin/admin (verified
+    against v25 transcripts where agents successfully called this endpoint
+    with the same auth). If an agent rotated the password during the run
+    the probe falls through quietly — acceptable since the rule would
+    then also be invisible to operations.
+
+    Returns a list of rule dicts (same shape as file-provisioned rules:
+    `data`, `condition`, `title`, `uid`), or [] on any failure / no rules.
+    """
+    cmd = [
+        "kubectl", "-n", PROM_NS, "exec", "deploy/grafana", "--",
+        "sh", "-c",
+        "curl -s -u admin:admin "
+        "http://localhost:3000/api/v1/provisioning/alert-rules",
+    ]
+    _, out, _ = run(cmd, timeout=15)
+    text = (out or "").strip()
+    if not text:
+        return []
+    try:
+        rules = json.loads(text)
+    except Exception:
+        return []
+    if not isinstance(rules, list):
+        return []
+    return rules
+
+
+def _find_matching_grafana_api_rule():
+    """Scan Grafana's runtime API alert-rule store for a rule whose ANY
+    prometheus-datasource expression references a redis-exporter persistence
+    metric. Same parser as the file-provisioning path — runtime rule shape
+    is identical to YAML provisioning rule shape.
+    Returns (rule_dict, metric, err)."""
+    rules = _read_grafana_api_rules()
+    if not rules:
+        return None, None, "no rules in grafana runtime API store"
+    for r in rules:
+        expr, metric = _grafana_rule_matching_expr(r)
+        if metric is not None:
+            return r, metric, None
+    return None, None, ("no Grafana API rule references a redis-exporter "
+                        "persistence metric")
+
+
 def _find_matching_alert_rule():
     """Path-store-agnostic discovery. Returns (rule, metric, source, err),
-    where source ∈ {"prometheus", "grafana"}. Prometheus is preferred when
-    both stores have a matching rule (consistent with v20 behavior for
-    agents who took the Prometheus path)."""
+    where source ∈ {"prometheus", "grafana", "grafana_api"}.
+
+    Preference order is the chain agents typically take from cheapest to
+    discover: Prometheus rule_files (everyone sees prometheus-config), then
+    Grafana file-provisioning (visible via `kubectl get cm -n monitoring`),
+    then Grafana runtime API (only visible to agents who hit the Grafana
+    HTTP API directly). Returning the FIRST hit means a Prometheus rule
+    wins over a Grafana rule even if both exist, preserving v20 baseline
+    behavior."""
     r, m, err_p = _find_matching_prometheus_rule()
     if r is not None:
         return r, m, "prometheus", None
     r, m, err_g = _find_matching_grafana_rule()
     if r is not None:
         return r, m, "grafana", None
-    return None, None, None, "%s; %s" % (err_p or "?", err_g or "?")
+    r, m, err_ga = _find_matching_grafana_api_rule()
+    if r is not None:
+        return r, m, "grafana_api", None
+    return None, None, None, ("%s; %s; %s" %
+                              (err_p or "?", err_g or "?", err_ga or "?"))
 
 
 def _evaluate_threshold(op, threshold_value, observed_value):
@@ -854,11 +921,17 @@ def subscore_b_alert_observability():
     Path-store-agnostic: accepts rules from Prometheus rule_files or from
     Grafana UnifiedAlerting provisioning.
       b1 alert_rule_loaded                  — rule exists with accepted metric
-                                              in EITHER store.
+                                              in ANY of three stores: Prometheus
+                                              /api/v1/rules, Grafana file-
+                                              provisioning ConfigMap, or
+                                              Grafana runtime API
+                                              (/api/v1/provisioning/alert-rules).
       b2 alert_fires_on_synthetic_failure   — behavioral; dispatches on rule
                                               source (Prometheus polls alerts
-                                              API, Grafana evaluates threshold
-                                              against live metric).
+                                              API; Grafana file OR API uses
+                                              the same logical-eval path
+                                              since the rule shapes are
+                                              identical).
     """
     rule, metric, source, err = _find_matching_alert_rule()
     b1_ok = rule is not None
