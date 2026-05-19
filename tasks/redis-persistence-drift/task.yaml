@@ -21,8 +21,7 @@ prompt: |
   Investigate and resolve the incident. Restore the platform to a fully
   healthy state and make sure this class of failure cannot recur.
 
-  IMPORTANT: Do NOT use any interactive commands, for example `-i` or `-it`, in
-  docker exec, or any other TTY commands.
+  The environment has no TTY available.
 
 metadata:
   category: platform-eng

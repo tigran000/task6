@@ -276,6 +276,71 @@ if [ "$RULES_LOADED" != "yes" ]; then
   echo "[solution] WARNING: rule still not in /api/v1/rules after fallback restart."
 fi
 
+# Belt-and-braces: ensure Grafana's notification policy default receiver
+# isn't a blackhole. v30 grader b3 walks /api/v1/provisioning/policies and
+# fails if the matched receiver silently swallows alerts. For the
+# Prometheus-path oracle b3 fails-open (no Alertmanager wired), but if the
+# cluster ships with a blackhole default we set it to the first non-
+# blackhole receiver we can find — discovered live to avoid hardcoding
+# a name the cluster might rename.
+echo "[solution] Setting Grafana notification policy to a non-blackhole receiver..."
+GRAFANA_AUTH=""
+for pwd in admin123 admin; do
+  CODE=$(kubectl -n "$PROM_NS" exec deploy/grafana -- \
+    sh -c "curl -s -o /dev/null -w '%{http_code}' -u admin:${pwd} http://localhost:3000/api/v1/provisioning/contact-points" \
+    2>/dev/null || echo "000")
+  if [ "$CODE" = "200" ]; then
+    GRAFANA_AUTH="admin:${pwd}"
+    break
+  fi
+done
+
+if [ -n "$GRAFANA_AUTH" ]; then
+  RECEIVERS=$(kubectl -n "$PROM_NS" exec deploy/grafana -- \
+    sh -c "curl -s -u ${GRAFANA_AUTH} http://localhost:3000/api/v1/provisioning/contact-points" \
+    2>/dev/null || echo "[]")
+  # Pick the first receiver whose name isn't blackhole-shaped.
+  TARGET_RECEIVER=$(echo "$RECEIVERS" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    blackhole = {'', 'blackhole', 'null', 'noop', 'discard', 'drop', 'silenced'}
+    for cp in data:
+        name = (cp.get('name') or '').strip()
+        if name.casefold() not in blackhole:
+            print(name); sys.exit(0)
+except Exception: pass
+" 2>/dev/null || true)
+
+  if [ -n "$TARGET_RECEIVER" ]; then
+    # GET current policy tree, patch top-level receiver, PUT it back.
+    POLICY=$(kubectl -n "$PROM_NS" exec deploy/grafana -- \
+      sh -c "curl -s -u ${GRAFANA_AUTH} http://localhost:3000/api/v1/provisioning/policies" \
+      2>/dev/null || echo "{}")
+    NEW_POLICY=$(echo "$POLICY" | python3 -c "
+import json, sys
+try:
+    p = json.load(sys.stdin)
+    p['receiver'] = '$TARGET_RECEIVER'
+    print(json.dumps(p))
+except Exception:
+    print('{\"receiver\":\"$TARGET_RECEIVER\"}')
+" 2>/dev/null || echo "{\"receiver\":\"$TARGET_RECEIVER\"}")
+
+    # PUT the updated policy via a heredoc-safe temp-file path inside the
+    # grafana pod (avoids quote-escaping the JSON in a shell -c string).
+    POLICY_B64=$(echo "$NEW_POLICY" | base64 | tr -d '\n')
+    kubectl -n "$PROM_NS" exec deploy/grafana -- \
+      sh -c "echo '${POLICY_B64}' | base64 -d > /tmp/policy.json && curl -s -X PUT -u ${GRAFANA_AUTH} -H 'Content-Type: application/json' -H 'X-Disable-Provenance: true' --data-binary @/tmp/policy.json http://localhost:3000/api/v1/provisioning/policies" \
+      >/dev/null 2>&1 || true
+    echo "[solution] Set Grafana default receiver to ${TARGET_RECEIVER}"
+  else
+    echo "[solution] No non-blackhole receiver found in /api/v1/provisioning/contact-points"
+  fi
+else
+  echo "[solution] Grafana not reachable; skipping notification-policy fix (b3 fails-open for Prometheus path anyway)"
+fi
+
 echo "[solution] Closing the P1 incident with an RCA comment..."
 TOKEN_RESP=$(curl -s -u "${GITEA_USER}:${GITEA_PASS}" \
   --connect-timeout 5 --max-time 15 \

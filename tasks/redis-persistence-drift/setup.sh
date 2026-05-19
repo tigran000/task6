@@ -227,11 +227,11 @@ kubectl -n bleater rollout status deploy/bleater-bleat-service --timeout=90s >/d
 # Second in-app reverter sidecar, installed in a DIFFERENT Deployment
 # (bleater-timeline-service). Different name (redis-pool-sizer) to look
 # like an unrelated connection-pool tuner. Same behavioral shape
-# (CONFIG SET appendonly no loop) so a3's _is_reverter_shaped catches it
-# regardless of name. Cross-deployment placement is the variance lever:
-# agents who only audit bleat-service's container list miss this one
-# entirely. Restores v23-era a3 find-rate (~40-60%) after v25's batch
-# saturated at 5/5.
+# (CONFIG SET appendonly no loop). v30 grader's behavioral a3 probe
+# detects any live reverter regardless of which deployment hosts it,
+# so the second placement is purely to increase the chance that some
+# reverter survives the agent's cleanup pass (agents who only audit
+# bleat-service's container list miss this one entirely).
 echo "[setup] Installing redis-pool-sizer sidecar in bleater-timeline-service..."
 kubectl -n bleater patch deployment bleater-timeline-service --type=json -p='[
   {"op":"add","path":"/spec/template/spec/containers/-","value":{
@@ -408,6 +408,9 @@ if [ -n "$GITEA_TOKEN" ]; then
   complaints — please make sure on-call gets notified next time.
   (The platform uses Prometheus and Grafana — one of those should
   have caught this.)
+- When you wire alerts, double-check the notification policy actually
+  routes critical alerts somewhere people see. We had a near-miss last
+  quarter where a rule fired correctly but the route dropped it.
 - Please make sure whatever caused this cannot recur
 EOF
 )

@@ -14,42 +14,38 @@ between-subscore checks are independent code paths.
          redis-config-watchdog) is still alive and has flipped the sts
          to `--appendonly no` and `--save ""`, the new pod loads from
          RDB but writes after the last BGSAVE are lost on the next cycle.
-      a3 no_reverter_sidecar_in_bleat_service
-         The bleater-bleat-service Deployment must contain no container
-         whose command/args look like a redis-config reverter — anything
-         calling `CONFIG SET appendonly no`, `CONFIG SET save ""`, or
-         `CONFIG SET appendfsync no` in a loop. Behavior-based, so an
-         agent who renames the cache-config-tuner sidecar to something
-         benign still fails this check.
+      a3 no_live_reverter_undoing_config  (BEHAVIORAL)
+         Probes for live in-app reverters by writing a known-good value
+         (`CONFIG SET appendonly yes`), waiting through the 5-7s reverter-
+         loop window, and reading back. Any sidecar/cronjob still
+         actively reverting the config flips the value within the window
+         and the check fails. Single behavioral probe — no list-bundling,
+         no name match, no static YAML inspection. Catches reverters in
+         any pod / any deployment / any namespace, including renames.
 
   B alert_observability     (weight 0.5)
-      b1 alert_rule_loaded
-         Path-store-agnostic across THREE stores. Accepts any of:
-           (i) Prometheus /api/v1/rules — file-based rule_files config.
-           (ii) Grafana file-provisioning ConfigMap
-                `monitoring/grafana-alerting-provisioning` (alert-rules.yaml).
-           (iii) Grafana runtime API
-                 `/api/v1/provisioning/alert-rules` — picks up rules created
-                 via POST with X-Disable-Provenance: true that never land in
-                 (ii). Default cluster auth is admin/admin.
-         Any rule whose primary prometheus expression references the
-         redis-exporter persistence metric whitelist passes. Tests the
-         realistic capability ("wire an alert visible to the platform's
-         monitoring stack"), not "guess which store the grader prefers."
       b2 alert_fires_on_synthetic_failure  (BEHAVIORAL)
-         Same isolation as v23: suspend reverters, scale bleat-service
-         to 0, patch sts to known-good, wait for redis_aof_enabled=1.
-         Then dispatch by rule source:
-           Prometheus rule  → inject failure, poll /api/v1/alerts up
-                              to 60s for pending|firing. Pre-state
-                              must be inactive (catches decoration).
-           Grafana rule     → query Prometheus instant API for the
-                              rule's primary model.expr in both pre-
-                              and post-injection states, apply the
-                              rule's threshold condition. Pre-state
-                              must NOT trigger (catches decoration);
-                              post-state MUST trigger.
-         State restored in finally regardless of source.
+         Discovers a rule referencing a redis-exporter persistence metric
+         in any of three stores (Prometheus /api/v1/rules, Grafana file-
+         provisioning CM, Grafana runtime API), runs it inside isolation
+         (suspend reverters, scale bleat-service to 0, patch sts to
+         known-good, wait for redis_aof_enabled=1), injects a synthetic
+         failure, and asserts state transition (inactive→pending/firing
+         for Prometheus rules; threshold-eval pre/post-injection for
+         Grafana rules). The pre-state gate catches decorative always-
+         firing rules; the post-injection check catches stuck-off rules.
+         No-rule-found is reported as a behavioral failure ("no rule to
+         test"), so this single check subsumes "rule exists" + "rule
+         fires" without a separate static presence atom.
+      b3 alert_routes_to_pageable_receiver  (BEHAVIORAL, NON-DESTRUCTIVE)
+         Walks Grafana's notification policy tree top-down against the
+         matched rule's labels (curl /api/v1/provisioning/policies from
+         inside the Grafana pod). The matched receiver must not be in
+         the blackhole set (`blackhole`/`null`/`noop`/`discard`/`drop`/
+         `silenced`/empty). Prometheus-store rules fail-open (this
+         snapshot has no Alertmanager wired). Policy-config-only — no
+         cluster mutation, no isolation overhead, can run before or
+         after b2.
 
 A and B are fully independent. A is measured against the cluster state
 the agent left behind. Before B starts measuring, the grader takes
@@ -171,55 +167,51 @@ def _data_mount_is_pvc(pod_name):
     return False
 
 
-# Deployments where setup.sh plants in-app reverter sidecars. a3 audits
-# every entry — agents must clean ALL of them, not just the obvious
-# bleat-service one. v27 added bleater-timeline-service after v25 batch
-# showed agents reliably finding the single bleat-service sidecar
-# (saturated a3 at 5/5).
-_REVERTER_SIDECAR_DEPLOYMENTS = [
-    "bleater-bleat-service",
-    "bleater-timeline-service",
-]
+# v30 a3 is behavioral: instead of inspecting Deployment YAML for reverter-
+# shaped containers (static config check that the rubric flagged as
+# Functional-Tests-as-Subscores violation AND No-Binary-Bundling violation
+# when it AND-gated multiple deployments), the grader actively probes for
+# live reverter behavior. It writes a known-good value into Redis, waits
+# long enough for any 5-7s reverter loop to fire several times, then reads
+# back. If anything is still actively reverting the config (in ANY pod,
+# in ANY namespace, regardless of name or location), the value flips and
+# a3 fails. Single behavioral check, no list-bundling, no name match.
+_A3_PROBE_WINDOW_SECONDS = 30
+_A3_PROBE_KEY = "appendonly"
+_A3_PROBE_GOOD_VALUE = "yes"
 
 
-def _deploy_containers(deploy_name):
-    """Return the list of container dicts in the named Deployment's spec,
-    or None if the Deployment is unreadable / absent."""
-    _, out, _ = run(
-        KUBECTL + ["get", "deploy", deploy_name, "-o", "json"],
-        timeout=15,
-    )
-    out = (out or "").strip()
-    if not out:
-        return None
-    try:
-        d = json.loads(out)
-        return (d.get("spec", {})
-                 .get("template", {})
-                 .get("spec", {})
-                 .get("containers", []))
-    except Exception:
-        return None
-
-
-def _is_reverter_shaped(container):
-    """Behavior-based detection of a redis-config reverter container.
-    Catches the cache-config-tuner sidecar AND any rename of it: anything
-    whose command/args looks like a redis-cli loop that flips persistence
-    config (`CONFIG SET appendonly no` or `CONFIG SET save ""`)."""
-    parts = (container.get("command") or []) + (container.get("args") or [])
-    joined = " ".join(parts).lower()
-    if "config set" not in joined:
-        return False
-    if "appendonly" in joined and " no" in joined:
-        return True
-    if "appendfsync" in joined and " no" in joined:
-        return True
-    # `CONFIG SET save ""` — the empty string survives the .lower() pipeline
-    # as just two quotes; look for the disabling pattern directly.
-    if " save " in joined and ('""' in joined or "''" in joined):
-        return True
-    return False
+def _a3_no_live_reverter(pod):
+    """Behavioral probe for live reverters. Returns (ok, detail)."""
+    if not pod:
+        return False, "no redis pod available for a3 probe"
+    # Drive the runtime config to the known-good state.
+    redis_cli(pod, "CONFIG", "SET", _A3_PROBE_KEY, _A3_PROBE_GOOD_VALUE)
+    # Verify the set landed (sanity check — should always be true for a
+    # responsive Redis).
+    out = redis_cli(pod, "CONFIG", "GET", _A3_PROBE_KEY)
+    lines = out.splitlines()
+    if len(lines) < 2 or lines[1].strip() != _A3_PROBE_GOOD_VALUE:
+        return False, ("CONFIG SET %s %s did not land (got=%r)" %
+                       (_A3_PROBE_KEY, _A3_PROBE_GOOD_VALUE, out))
+    # Wait long enough for any sidecar reverter on a 5-7s loop to fire
+    # at least 3-4 times.
+    time.sleep(_A3_PROBE_WINDOW_SECONDS)
+    # Re-read. If a reverter is alive in any pod hitting redis, the value
+    # has flipped.
+    out = redis_cli(pod, "CONFIG", "GET", _A3_PROBE_KEY)
+    lines = out.splitlines()
+    if len(lines) < 2:
+        return False, ("could not read %s back after probe window (out=%r)" %
+                       (_A3_PROBE_KEY, out))
+    val = lines[1].strip()
+    if val == _A3_PROBE_GOOD_VALUE:
+        return True, ("%s stable at %r for %ds — no live reverter detected" %
+                      (_A3_PROBE_KEY, _A3_PROBE_GOOD_VALUE,
+                       _A3_PROBE_WINDOW_SECONDS))
+    return False, ("%s flipped to %r within %ds — live reverter is undoing "
+                   "config (some sidecar/cronjob is still active)" %
+                   (_A3_PROBE_KEY, val, _A3_PROBE_WINDOW_SECONDS))
 
 
 def subscore_a_persistence_durability():
@@ -240,27 +232,28 @@ def subscore_a_persistence_durability():
                                               trip fails. Agents must kill
                                               the watchdog AND its RBAC for
                                               this check to pass.
-    a3 no_reverter_sidecar_in_bleat_service —
-                                              Independent topology check.
-                                              The bleater-bleat-service
-                                              Deployment must not contain
-                                              any container whose command/
-                                              args call `CONFIG SET appendonly
-                                              no` / `save ""` / `appendfsync
-                                              no` in a loop (behavior-based,
-                                              so renames don't bypass).
-                                              Catches agents who repaired
-                                              persistence but missed the
-                                              camouflaged 5s sidecar — the
-                                              lowest-visibility reverter,
-                                              hidden inside another app's
-                                              container list.
+    a3 no_live_reverter_undoing_config —
+                                              Behavioral probe. Sets a known-
+                                              good config value (CONFIG SET
+                                              appendonly yes), waits 30s
+                                              (long enough for 5-7s reverter
+                                              loops to fire 3-4 times), and
+                                              reads back. Any sidecar/cronjob
+                                              still actively reverting the
+                                              config in any pod/deployment/
+                                              namespace flips the value
+                                              within the window and the
+                                              check fails. Single behavioral
+                                              probe — no name match, no
+                                              static spec inspection, no
+                                              list-bundling across
+                                              deployments.
     """
     pod = wait_for_redis(timeout=120)
     if not pod:
         return [0, 0], [
             ("baseline_survives_restart", False, "no redis pre-probe"),
-            ("no_reverter_sidecar_in_bleat_service", False,
+            ("no_live_reverter_undoing_config", False,
              "redis unavailable; cannot validate cluster state"),
         ]
 
@@ -288,41 +281,19 @@ def subscore_a_persistence_durability():
         a1_detail = ("round-trip + /data on PVC" if a1_ok else
                      "value_ok=%s pvc_mount=%s got=%r" % (a1_value_ok, a1_pvc_ok, a1_got))
 
-    # a3: behavior-based topology check on every deployment that setup.sh
-    # plants a reverter sidecar into. Reads each Deployment's spec,
-    # classifies each container by what its command/args actually DO (not
-    # by name), and fails if ANY deployment still has a reverter-shaped
-    # container. Closes both the rename-bypass (behavior-based detection)
-    # AND the "only audit the obvious deployment" path (multi-deployment).
-    per_deploy = []
-    overall_bad = []
-    unreadable = []
-    for deploy in _REVERTER_SIDECAR_DEPLOYMENTS:
-        containers = _deploy_containers(deploy)
-        if containers is None:
-            unreadable.append(deploy)
-            continue
-        reverter_names = [c.get("name", "?") for c in containers
-                          if _is_reverter_shaped(c)]
-        all_names = [c.get("name", "?") for c in containers]
-        per_deploy.append((deploy, all_names, reverter_names))
-        if reverter_names:
-            overall_bad.append((deploy, reverter_names))
-    if unreadable:
-        a3_ok = False
-        a3_detail = ("could not read deployment(s): %s" % unreadable)
-    elif overall_bad:
-        a3_ok = False
-        a3_detail = ("reverter-shaped sidecar(s) still attached: %s" %
-                     [(d, names) for d, names in overall_bad])
-    else:
-        a3_ok = True
-        a3_detail = ("no reverter-shaped sidecar in any audited deployment "
-                     "(%s)" % [(d, names) for d, names, _ in per_deploy])
+    # a3: behavioral probe for live reverters. Set Redis's appendonly to a
+    # known-good value, wait through the 5-7s reverter loop window, read
+    # back. Any sidecar/cronjob (in any pod, any namespace, regardless of
+    # name) actively reverting the config will flip the value within the
+    # window and we catch it. Replaces v27's static multi-deployment
+    # YAML audit (which the v29 rubrics flagged as both
+    # Functional-Tests-as-Subscores and No-Binary-Bundling violations).
+    probe_pod = redis_pod() if new_pod is None else new_pod
+    a3_ok, a3_detail = _a3_no_live_reverter(probe_pod)
 
     return [int(a1_ok), int(a3_ok)], [
         ("baseline_survives_restart", a1_ok, a1_detail),
-        ("no_reverter_sidecar_in_bleat_service", a3_ok, a3_detail),
+        ("no_live_reverter_undoing_config", a3_ok, a3_detail),
     ]
 
 
@@ -634,6 +605,135 @@ def _prom_instant_value(expr, timeout=15):
         return float(val_pair[1])
     except (TypeError, ValueError):
         return None
+
+
+# Receivers that silently swallow notifications. Empty string covers the
+# (surprisingly common) case where the policy has no receiver set at all.
+_BLACKHOLE_RECEIVER_NAMES = {
+    "", "blackhole", "null", "noop", "discard", "drop", "silenced",
+}
+
+
+def _read_grafana_notification_policies():
+    """Read Grafana's runtime notification-policy tree via
+    /api/v1/provisioning/policies. Same auth handling as the rule store
+    probe (try admin:admin123 first, fall back to admin:admin). Returns
+    the policy root dict, or None on failure."""
+    for pwd in ("admin123", "admin"):
+        cmd = [
+            "kubectl", "-n", PROM_NS, "exec", "deploy/grafana", "--",
+            "sh", "-c",
+            (r"curl -s -w '\n%{http_code}' -u admin:" + pwd + " "
+             "http://localhost:3000/api/v1/provisioning/policies"),
+        ]
+        _, out, _ = run(cmd, timeout=15)
+        text = (out or "").strip()
+        if not text:
+            continue
+        idx = text.rfind("\n")
+        if idx == -1:
+            continue
+        body, code = text[:idx], text[idx + 1:].strip()
+        if code != "200":
+            continue
+        try:
+            return json.loads(body)
+        except Exception:
+            continue
+    return None
+
+
+def _route_matches_labels(route, labels):
+    """Check if a Grafana route matches a label set, supporting all four
+    matcher shapes Grafana has shipped over the years: `match` (kv map),
+    `match_re` (regex kv map), `matchers` (list of strings like
+    `"k=\"v\""`), `object_matchers` (list of [name, op, value] tuples)."""
+    # Legacy `match` (exact equality kv map)
+    for k, v in (route.get("match") or {}).items():
+        if labels.get(k) != v:
+            return False
+    # Legacy `match_re` (regex kv map)
+    for k, v in (route.get("match_re") or {}).items():
+        if not re.search(v, labels.get(k, "") or ""):
+            return False
+    # Current `matchers` (list of strings like `severity="critical"`)
+    for m in (route.get("matchers") or []):
+        # parse "name=value" / "name!=value" / "name=~regex" / "name!~regex"
+        mm = re.match(r'^\s*([A-Za-z_][A-Za-z_0-9]*)\s*(=~|!=|!~|=)\s*"?([^"]*)"?\s*$', m or "")
+        if not mm:
+            continue
+        name, op, val = mm.group(1), mm.group(2), mm.group(3)
+        actual = labels.get(name, "") or ""
+        if op == "=" and actual != val:
+            return False
+        if op == "!=" and actual == val:
+            return False
+        if op == "=~" and not re.search(val, actual):
+            return False
+        if op == "!~" and re.search(val, actual):
+            return False
+    # Current `object_matchers` (list of [name, op, value] triples)
+    for triple in (route.get("object_matchers") or []):
+        if not isinstance(triple, (list, tuple)) or len(triple) < 3:
+            continue
+        name, op, val = triple[0], triple[1], triple[2]
+        actual = labels.get(name, "") or ""
+        if op == "=" and actual != val:
+            return False
+        if op == "!=" and actual == val:
+            return False
+        if op == "=~" and not re.search(val, actual):
+            return False
+        if op == "!~" and re.search(val, actual):
+            return False
+    return True
+
+
+def _resolve_route_receiver(policy_root, labels):
+    """Walk the notification-policy tree top-down, first-match-wins, to
+    determine which receiver the rule's labels would route to. Returns the
+    receiver name (lowercased + stripped) or "" if the policy is empty."""
+    if not policy_root:
+        return ""
+    # Walk children depth-first, first match wins. If no child matches,
+    # the current node's receiver is effective.
+    current = policy_root
+    while True:
+        children = current.get("routes") or []
+        next_match = None
+        for child in children:
+            if _route_matches_labels(child, labels):
+                next_match = child
+                break
+        if next_match is None:
+            break
+        current = next_match
+        # Continue if this matched route allows further descent.
+        if not (current.get("routes") or []):
+            break
+    receiver = current.get("receiver") or ""
+    return str(receiver).strip().casefold()
+
+
+def _b3_route_is_pageable(rule, source):
+    """Check that the matched alert rule's notification path terminates at
+    a non-blackhole receiver. For Prometheus-store rules this snapshot has
+    no Alertmanager wired, so the check fails open (returns True). For
+    Grafana-store rules (file or runtime API), walk the Grafana
+    notification-policy tree."""
+    if source == "prometheus":
+        return True, "alertmanager not deployed on this snapshot; route check skipped"
+    policy = _read_grafana_notification_policies()
+    if not policy:
+        return False, ("could not read Grafana notification policies "
+                       "(auth or endpoint unreachable)")
+    labels = rule.get("labels") or {}
+    receiver = _resolve_route_receiver(policy, labels)
+    if receiver in _BLACKHOLE_RECEIVER_NAMES:
+        return False, ("rule routes to blackhole-shaped receiver %r "
+                       "(rule labels=%s — route silently drops notifications)"
+                       % (receiver, labels))
+    return True, ("rule routes to receiver %r (non-blackhole)" % receiver)
 
 
 # Accepted metric families for a "Redis persistence regressed" alert.
@@ -983,32 +1083,41 @@ def _b2_grafana_path(rule, pod):
 
 def subscore_b_alert_observability():
     """AND-gate of 2 checks, isolated from A so subscore independence holds.
-    Path-store-agnostic: accepts rules from Prometheus rule_files or from
-    Grafana UnifiedAlerting provisioning.
-      b1 alert_rule_loaded                  — rule exists with accepted metric
-                                              in ANY of three stores: Prometheus
-                                              /api/v1/rules, Grafana file-
-                                              provisioning ConfigMap, or
-                                              Grafana runtime API
-                                              (/api/v1/provisioning/alert-rules).
-      b2 alert_fires_on_synthetic_failure   — behavioral; dispatches on rule
-                                              source (Prometheus polls alerts
-                                              API; Grafana file OR API uses
-                                              the same logical-eval path
-                                              since the rule shapes are
-                                              identical).
+    Path-store-agnostic: accepts rules from Prometheus rule_files, Grafana
+    file-provisioning ConfigMap, or Grafana runtime API.
+      b2 alert_fires_on_synthetic_failure       — behavioral; discovers the
+                                                  rule across all three
+                                                  stores then verifies it
+                                                  transitions under injection
+                                                  inside the v23 cluster
+                                                  isolation. No rule found →
+                                                  fails as "no rule to test".
+      b3 alert_routes_to_pageable_receiver      — behavioral routing check;
+                                                  walks Grafana notification
+                                                  policies to confirm the
+                                                  rule's labels resolve to a
+                                                  non-blackhole receiver.
+                                                  Prometheus-store rules fail
+                                                  open (no Alertmanager).
     """
     rule, metric, source, err = _find_matching_alert_rule()
-    b1_ok = rule is not None
-    if b1_ok:
+    if rule is not None:
         if source == "prometheus":
             rule_label = rule.get("name", "?")
         else:
             rule_label = rule.get("title") or rule.get("uid") or "?"
-        b1_detail = ("matched %s [%s] on metric %s" %
-                     (rule_label, source, metric or "?"))
+        rule_summary = "matched %s [%s] on metric %s" % (
+            rule_label, source, metric or "?")
     else:
-        b1_detail = err or "no rule"
+        rule_summary = err or "no rule"
+
+    # b3 first — it's policy-config-only, no cluster mutation, cheap. Runs
+    # outside the isolation harness. If no rule was found, b3 cascades.
+    if rule is None:
+        b3_ok = False
+        b3_detail = "no rule to test (no matching alert rule found in any store)"
+    else:
+        b3_ok, b3_detail = _b3_route_is_pageable(rule, source)
 
     isolation_state = None
     try:
@@ -1016,7 +1125,7 @@ def subscore_b_alert_observability():
 
         if not rule:
             b2_ok = False
-            b2_detail = "no rule to test (b1 failed)"
+            b2_detail = ("no rule to test — %s" % rule_summary)
         elif not pod:
             b2_ok = False
             b2_detail = ("could not bring redis to known-good state for b2 "
@@ -1028,9 +1137,9 @@ def subscore_b_alert_observability():
     finally:
         _restore_cluster_after_b2(isolation_state)
 
-    return [int(b1_ok), int(b2_ok)], [
-        ("alert_rule_loaded", b1_ok, b1_detail),
+    return [int(b2_ok), int(b3_ok)], [
         ("alert_fires_on_synthetic_failure", b2_ok, b2_detail),
+        ("alert_routes_to_pageable_receiver", b3_ok, b3_detail),
     ]
 
 
