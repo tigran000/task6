@@ -14,15 +14,17 @@ between-subscore checks are independent code paths.
          bleater-redis sts command-args back. Catches quiesced reverters
          (CronJob spec.suspend=true, scale-to-0, host-Deployment rolled)
          AND reverters planted on the Redis sts itself.
-      a4 persistence_config_durably_correct  (BEHAVIOR-BASED SPEC READ)
-         Inspect the bleater-redis StatefulSet spec — all four properties
-         must hold: --save flag with a non-empty value (RDB enabled),
-         --appendonly yes (AOF enabled), --dir is /data or unset (not
-         /tmp), and /data is backed by a persistentVolumeClaim (not
-         emptyDir). Catches agents who restored runtime CONFIG SET but
-         left the sts spec broken — first pod restart reverts. All four
-         are properties of one resource (the sts spec), answering one
-         question (is persistence durably configured?).
+      a4 no_orphan_watchdog_rbac  (CLUSTER-STATE AUDIT)
+         The redis-config-watchdog CronJob is one of six planted
+         reverters; setup.sh provisions it with cross-namespace RBAC
+         (ServiceAccount in monitoring + Role and RoleBinding in
+         bleater) granting patch rights on bleater statefulsets. The
+         atom verifies all three RBAC artifacts are gone, not just the
+         CronJob. Catches agents who delete the visible CronJob but
+         leave the privilege escalation primitive in place — anyone
+         (or any new workload) reclaiming that SA could re-plant the
+         reverter. Same theme as a3 ("nothing in the cluster will undo
+         persistence again"), but inspects a different resource family.
 
   B alert_observability     (weight 0.5)  — AND-gate of 3 atoms.
       b1 alert_rule_loaded
@@ -247,123 +249,72 @@ def _a3_spec_audit_no_reverter_sidecar():
                   "(%s)" % [(k, n, ns) for k, n, ns, _, _ in per_resource])
 
 
-def _a4_persistence_config_durably_correct():
-    """Inspect the bleater-redis StatefulSet spec. All four properties
-    of one resource must hold for persistence to survive a pod restart:
-      1. --save <non-empty> in the redis container's command-args
-         (RDB enabled — empty/missing means snapshots are off)
-      2. --appendonly yes (AOF enabled in the spec, not just runtime)
-      3. --dir is /data or unset (default /data) — not /tmp or other
-         ephemeral path
-      4. /data volume is backed by a persistentVolumeClaim (via a
-         volumeClaimTemplate or an explicit PVC volume) — not emptyDir
+# RBAC artifacts setup.sh creates for the redis-config-watchdog CronJob.
+# All three must be deleted by the agent — leaving any one behind means
+# another workload (or a respawned CronJob) can re-claim the same SA and
+# regain patch rights on bleater statefulsets, re-planting the reverter.
+_WATCHDOG_RBAC_ARTIFACTS = [
+    (PROM_NS, "serviceaccount", "redis-config-watchdog"),
+    (NS, "role", "redis-config-watchdog"),
+    (NS, "rolebinding", "redis-config-watchdog"),
+]
+
+
+def _a4_no_orphan_watchdog_rbac():
+    """Verify the redis-config-watchdog's RBAC artifacts are all deleted.
+    The watchdog CronJob is one of six planted reverters; setup.sh
+    provisions it with a ServiceAccount (in monitoring) and a Role +
+    RoleBinding (in bleater) granting patch rights on
+    statefulsets/bleater-redis. Agents who delete only the visible
+    CronJob leave the privilege escalation primitive intact — any new
+    workload reclaiming that SA could re-plant the reverter.
     Returns (ok, detail)."""
-    rc, out, _ = run(
-        KUBECTL + ["get", "sts", "bleater-redis", "-o", "json"],
-        timeout=15,
-    )
-    if rc != 0 or not (out or "").strip():
-        return False, "bleater-redis StatefulSet unreadable or missing"
-    try:
-        d = json.loads(out)
-    except Exception:
-        return False, "could not parse bleater-redis StatefulSet spec"
-
-    sts_spec = d.get("spec") or {}
-    pod_spec = (sts_spec.get("template") or {}).get("spec") or {}
-
-    redis_container = None
-    for c in pod_spec.get("containers", []) or []:
-        if c.get("name") == "redis":
-            redis_container = c
-            break
-    if redis_container is None:
-        return False, "no container named 'redis' in bleater-redis sts spec"
-
-    cmd_args = (redis_container.get("command") or []) + \
-               (redis_container.get("args") or [])
-
-    # 1. --save <non-empty>
-    save_value = None
-    for i, tok in enumerate(cmd_args):
-        if tok == "--save" and i + 1 < len(cmd_args):
-            save_value = cmd_args[i + 1]
-            break
-    save_ok = (save_value is not None
-               and save_value.strip() not in ("", '""', "''"))
-
-    # 2. --appendonly yes
-    aof_value = None
-    for i, tok in enumerate(cmd_args):
-        if tok == "--appendonly" and i + 1 < len(cmd_args):
-            aof_value = cmd_args[i + 1]
-            break
-    aof_ok = (aof_value is not None and aof_value.strip().lower() == "yes")
-
-    # 3. --dir /data or unset
-    dir_value = None
-    for i, tok in enumerate(cmd_args):
-        if tok == "--dir" and i + 1 < len(cmd_args):
-            dir_value = cmd_args[i + 1]
-            break
-    dir_ok = (dir_value is None) or (dir_value.strip() == "/data")
-
-    # 4. /data is PVC-backed (via a vct named "data" OR an explicit PVC volume)
-    pvc_ok = False
-    for vct in (sts_spec.get("volumeClaimTemplates") or []):
-        if (vct.get("metadata") or {}).get("name") == "data":
-            pvc_ok = True
-            break
-    if not pvc_ok:
-        volumes = {v["name"]: v for v in (pod_spec.get("volumes") or [])}
-        for m in (redis_container.get("volumeMounts") or []):
-            if m.get("mountPath") == "/data":
-                vol = volumes.get(m.get("name"), {})
-                if "persistentVolumeClaim" in vol:
-                    pvc_ok = True
-                break
-
-    if save_ok and aof_ok and dir_ok and pvc_ok:
-        return True, ("sts spec durable: --save=%r --appendonly=yes --dir=%s "
-                      "/data on PVC" %
-                      (save_value, dir_value or "/data (default)"))
-    return False, ("sts spec not durable: save_ok=%s (value=%r) aof_ok=%s "
-                   "(value=%r) dir_ok=%s (value=%r) pvc_ok=%s" %
-                   (save_ok, save_value, aof_ok, aof_value,
-                    dir_ok, dir_value, pvc_ok))
+    present = []
+    for namespace, kind, name in _WATCHDOG_RBAC_ARTIFACTS:
+        rc, out, _ = run(
+            ["kubectl", "-n", namespace, "get", kind, name, "-o", "name"],
+            timeout=10,
+        )
+        if rc == 0 and (out or "").strip():
+            present.append("%s/%s in %s" % (kind, name, namespace))
+    if present:
+        return False, ("watchdog RBAC orphan(s) remain: %s — these grant "
+                       "patch rights on bleater statefulsets, so another "
+                       "workload could re-claim the SA and re-plant the "
+                       "reverter" % present)
+    return True, "no watchdog RBAC orphans (SA + Role + RoleBinding all absent)"
 
 
 def subscore_a_persistence_durability():
-    """AND-gate of 2 atoms. Both inspect the cluster's Redis-persistence
-    resource state, answering one coherent question: 'Is Redis configured
-    for durable persistence, AND is nothing in the cluster going to
-    break it?'
-    a3 no_reverter_sidecar_in_bleat_service — Negative space. Behavior-
-                                              based spec audit across
+    """AND-gate of 2 atoms. Both inspect the cluster's residual reverter
+    surface, answering one coherent question: 'Has the agent left the
+    cluster free of latent re-breakers?'
+    a3 no_reverter_sidecar_in_bleat_service — Workload-spec residue.
+                                              Behavior-based scan across
                                               Deployments, the
                                               bleater-redis StatefulSet,
                                               and CronJob templates
                                               (_REVERTER_SIDECAR_RESOURCES).
                                               No container's command/args
                                               may match a reverter
-                                              pattern (redis-cli CONFIG
-                                              SET disabling persistence
-                                              OR kubectl patch flipping
-                                              the redis sts command).
-    a4 persistence_config_durably_correct  — Positive space. The
-                                              bleater-redis sts spec
-                                              itself must have AOF on,
-                                              RDB on, --dir /data, and
-                                              /data backed by a PVC.
-                                              Catches agents who fix
-                                              runtime CONFIG SET but
-                                              leave the sts spec broken.
+                                              pattern.
+    a4 no_orphan_watchdog_rbac             — RBAC residue. The
+                                              redis-config-watchdog's
+                                              ServiceAccount, Role, and
+                                              RoleBinding must all be
+                                              deleted. Leaving any of
+                                              them lets another workload
+                                              re-claim the patch rights
+                                              the original reverter used.
+                                              Same theme as a3 (cluster
+                                              free of re-breakers),
+                                              different resource family.
     """
     a3_spec_ok, a3_spec_detail = _a3_spec_audit_no_reverter_sidecar()
-    a4_ok, a4_detail = _a4_persistence_config_durably_correct()
+    a4_ok, a4_detail = _a4_no_orphan_watchdog_rbac()
     return [int(a3_spec_ok), int(a4_ok)], [
         ("no_reverter_sidecar_in_bleat_service", a3_spec_ok, a3_spec_detail),
-        ("persistence_config_durably_correct", a4_ok, a4_detail),
+        ("no_orphan_watchdog_rbac", a4_ok, a4_detail),
     ]
 
 
