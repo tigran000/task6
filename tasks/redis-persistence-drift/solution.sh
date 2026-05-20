@@ -89,6 +89,8 @@ pod["volumes"] = [v for v in (pod.get("volumes") or []) if v.get("name") != "dat
 # Keep only the canonical redis container — strip any reverter sidecars
 # planted on the sts (e.g., redis-metrics-exporter).
 pod["containers"] = [c for c in pod.get("containers", []) if c.get("name") == "redis"]
+# Remove any initContainers planted by setup.sh (data-initializer wiper).
+pod.pop("initContainers", None)
 # Restore the canonical command with persistence enabled
 for c in pod.get("containers", []):
     if c.get("name") == "redis":

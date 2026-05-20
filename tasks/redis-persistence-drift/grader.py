@@ -5,7 +5,7 @@ related but independent checks. Within-subscore checks share a theme;
 between-subscore checks are independent code paths.
 
   A persistence_durability  (weight 0.5)  — AND-gate of 2 atoms.
-      a3 no_reverter_sidecar_in_bleat_service  (BEHAVIOR-BASED SPEC AUDIT)
+      a1 no_reverter_sidecar_in_bleat_service  (BEHAVIOR-BASED SPEC AUDIT)
          Per-resource scan of _REVERTER_SIDECAR_RESOURCES — Deployments,
          the bleater-redis StatefulSet, and CronJob templates across the
          bleater and monitoring namespaces. Each container's command/args
@@ -14,17 +14,14 @@ between-subscore checks are independent code paths.
          bleater-redis sts command-args back. Catches quiesced reverters
          (CronJob spec.suspend=true, scale-to-0, host-Deployment rolled)
          AND reverters planted on the Redis sts itself.
-      a4 no_orphan_watchdog_rbac  (CLUSTER-STATE AUDIT)
-         The redis-config-watchdog CronJob is one of six planted
-         reverters; setup.sh provisions it with cross-namespace RBAC
-         (ServiceAccount in monitoring + Role and RoleBinding in
-         bleater) granting patch rights on bleater statefulsets. The
-         atom verifies all three RBAC artifacts are gone, not just the
-         CronJob. Catches agents who delete the visible CronJob but
-         leave the privilege escalation primitive in place — anyone
-         (or any new workload) reclaiming that SA could re-plant the
-         reverter. Same theme as a3 ("nothing in the cluster will undo
-         persistence again"), but inspects a different resource family.
+      a2 data_survives_pod_restart  (BEHAVIORAL)
+         Write a probe key, delete the redis pod, wait for restart, then
+         verify the key is still present. Passes only when persistence is
+         genuinely durable (PVC + AOF) AND the data-initializer
+         initContainer planted by setup.sh has been removed. The init-
+         Container wipes /data on every pod start, causing data loss even
+         after the persistence config is restored — invisible to a
+         config-only audit.
 
   B alert_observability     (weight 0.5)  — AND-gate of 3 atoms.
       b1 alert_rule_loaded
@@ -249,72 +246,60 @@ def _a3_spec_audit_no_reverter_sidecar():
                   "(%s)" % [(k, n, ns) for k, n, ns, _, _ in per_resource])
 
 
-# RBAC artifacts setup.sh creates for the redis-config-watchdog CronJob.
-# All three must be deleted by the agent — leaving any one behind means
-# another workload (or a respawned CronJob) can re-claim the same SA and
-# regain patch rights on bleater statefulsets, re-planting the reverter.
-_WATCHDOG_RBAC_ARTIFACTS = [
-    (PROM_NS, "serviceaccount", "redis-config-watchdog"),
-    (NS, "role", "redis-config-watchdog"),
-    (NS, "rolebinding", "redis-config-watchdog"),
-]
+_A2_TEST_KEY = "grader-durability-probe"
+_A2_TEST_VAL = "ok-persistence"
+_A2_POD_READY_TIMEOUT = 120
 
 
-def _a4_no_orphan_watchdog_rbac():
-    """Verify the redis-config-watchdog's RBAC artifacts are all deleted.
-    The watchdog CronJob is one of six planted reverters; setup.sh
-    provisions it with a ServiceAccount (in monitoring) and a Role +
-    RoleBinding (in bleater) granting patch rights on
-    statefulsets/bleater-redis. Agents who delete only the visible
-    CronJob leave the privilege escalation primitive intact — any new
-    workload reclaiming that SA could re-plant the reverter.
+def _a2_data_survives_pod_restart():
+    """Behavioral durability test. Write a probe key, delete the redis pod,
+    wait for it to restart, then verify the key is still present.
+    Passes only when BOTH conditions are met:
+      1. Persistence is correctly configured (PVC + AOF) so the data
+         is written to durable storage.
+      2. The data-initializer initContainer planted by setup.sh has been
+         removed — otherwise it wipes /data on every pod start, erasing
+         the key even when the PVC is present.
     Returns (ok, detail)."""
-    present = []
-    for namespace, kind, name in _WATCHDOG_RBAC_ARTIFACTS:
-        rc, out, _ = run(
-            ["kubectl", "-n", namespace, "get", kind, name, "-o", "name"],
-            timeout=10,
-        )
-        if rc == 0 and (out or "").strip():
-            present.append("%s/%s in %s" % (kind, name, namespace))
-    if present:
-        return False, ("watchdog RBAC orphan(s) remain: %s — these grant "
-                       "patch rights on bleater statefulsets, so another "
-                       "workload could re-claim the SA and re-plant the "
-                       "reverter" % present)
-    return True, "no watchdog RBAC orphans (SA + Role + RoleBinding all absent)"
+    pod = redis_pod()
+    if not pod:
+        return False, "no redis pod available for durability test"
+    redis_cli(pod, "SET", _A2_TEST_KEY, _A2_TEST_VAL, timeout=10)
+    run(["kubectl", "-n", NS, "delete", "pod", pod], timeout=30)
+    new_pod = wait_for_redis(timeout=_A2_POD_READY_TIMEOUT)
+    if not new_pod:
+        return False, ("redis pod did not come back within %ds after delete"
+                       % _A2_POD_READY_TIMEOUT)
+    val = redis_cli(new_pod, "GET", _A2_TEST_KEY, timeout=10).strip()
+    if val != _A2_TEST_VAL:
+        return False, ("key %r lost after pod restart (got %r) — "
+                       "initContainer wiper not removed or persistence "
+                       "not durably configured" % (_A2_TEST_KEY, val))
+    return True, ("key %r survived pod restart with value %r — "
+                  "persistence is durable" % (_A2_TEST_KEY, _A2_TEST_VAL))
 
 
 def subscore_a_persistence_durability():
-    """AND-gate of 2 atoms. Both inspect the cluster's residual reverter
-    surface, answering one coherent question: 'Has the agent left the
-    cluster free of latent re-breakers?'
-    a3 no_reverter_sidecar_in_bleat_service — Workload-spec residue.
-                                              Behavior-based scan across
-                                              Deployments, the
-                                              bleater-redis StatefulSet,
-                                              and CronJob templates
-                                              (_REVERTER_SIDECAR_RESOURCES).
-                                              No container's command/args
-                                              may match a reverter
-                                              pattern.
-    a4 no_orphan_watchdog_rbac             — RBAC residue. The
-                                              redis-config-watchdog's
-                                              ServiceAccount, Role, and
-                                              RoleBinding must all be
-                                              deleted. Leaving any of
-                                              them lets another workload
-                                              re-claim the patch rights
-                                              the original reverter used.
-                                              Same theme as a3 (cluster
-                                              free of re-breakers),
-                                              different resource family.
+    """AND-gate of 2 atoms, answering: 'Is persistence genuinely durable —
+    both in spec and under an actual pod restart?'
+    a1 no_reverter_sidecar_in_bleat_service — Spec audit. No container in
+                                              any of _REVERTER_SIDECAR_RESOURCES
+                                              may match a reverter-shaped
+                                              command/args pattern.
+    a2 data_survives_pod_restart           — Behavioral test. Write a probe
+                                              key, delete the redis pod,
+                                              wait for restart, verify the
+                                              key exists. Catches the
+                                              data-initializer initContainer
+                                              planted by setup.sh that wipes
+                                              /data on every pod start —
+                                              invisible to a config-only audit.
     """
-    a3_spec_ok, a3_spec_detail = _a3_spec_audit_no_reverter_sidecar()
-    a4_ok, a4_detail = _a4_no_orphan_watchdog_rbac()
-    return [int(a3_spec_ok), int(a4_ok)], [
-        ("no_reverter_sidecar_in_bleat_service", a3_spec_ok, a3_spec_detail),
-        ("no_orphan_watchdog_rbac", a4_ok, a4_detail),
+    a1_ok, a1_detail = _a3_spec_audit_no_reverter_sidecar()
+    a2_ok, a2_detail = _a2_data_survives_pod_restart()
+    return [int(a1_ok), int(a2_ok)], [
+        ("no_reverter_sidecar_in_bleat_service", a1_ok, a1_detail),
+        ("data_survives_pod_restart", a2_ok, a2_detail),
     ]
 
 

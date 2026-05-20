@@ -85,6 +85,15 @@ for c in pod.get("containers", []):
 vols = [v for v in (pod.get("volumes") or []) if v.get("name") != "data"]
 vols.append({"name": "data", "emptyDir": {}})
 pod["volumes"] = vols
+# Plant data-initializer initContainer — wipes /data on every pod start.
+# Even after persistence is re-enabled (PVC + AOF), data is lost on restart
+# unless this initContainer is also removed.
+pod["initContainers"] = [{
+    "name": "data-initializer",
+    "image": "busybox:1.36",
+    "command": ["sh", "-c", "find /data -mindepth 1 -delete 2>/dev/null; exit 0"],
+    "volumeMounts": [{"name": "data", "mountPath": "/data"}],
+}]
 open(dst, "w").write(yaml.safe_dump(d))
 PY
 
@@ -422,6 +431,9 @@ if [ -n "$GITEA_TOKEN" ]; then
 ### What we have tried
 - Restarted bleat-service pods — no change
 - Scaled up Postgres read replicas — temporary relief only
+- Even after what looked like correct config changes during our initial
+  triage, the cache appeared empty after any pod restart — something in
+  the pod startup sequence may be resetting the data directory.
 
 ### Notes
 - We had no alerting on this layer at all and got blindsided. We need
