@@ -431,9 +431,6 @@ if [ -n "$GITEA_TOKEN" ]; then
 ### What we have tried
 - Restarted bleat-service pods — no change
 - Scaled up Postgres read replicas — temporary relief only
-- Even after what looked like correct config changes during our initial
-  triage, the cache appeared empty after any pod restart — something in
-  the pod startup sequence may be resetting the data directory.
 
 ### Notes
 - We had no alerting on this layer at all and got blindsided. We need
