@@ -14,14 +14,16 @@ between-subscore checks are independent code paths.
          bleater-redis sts command-args back. Catches quiesced reverters
          (CronJob spec.suspend=true, scale-to-0, host-Deployment rolled)
          AND reverters planted on the Redis sts itself.
-      a2 argocd_application_synced  (CLUSTER-STATE AUDIT)
+      a2 argocd_application_synced  (BEHAVIORAL + CLUSTER-STATE AUDIT)
          The bleater-platform ArgoCD Application must have
-         spec.syncPolicy.automated set AND status.sync.status == 'Synced'.
-         Setup.sh strips automated sync so its breakage cannot be reverted
-         by selfHeal; a correct cleanup restores GitOps reconciliation so
-         the next drift event auto-reconciles. Same theme as a1 ("nothing
-         will undo persistence again"), different mechanism (live spec
-         vs reverter workloads).
+         spec.syncPolicy.automated set AND status.sync.status == 'Synced',
+         AND the selfHeal cycle must demonstrably revert an injected drift
+         within _A2_DRIFT_REVERT_TIMEOUT seconds. Setup.sh strips automated
+         sync; a correct cleanup restores GitOps reconciliation AND keeps
+         the source-of-truth aligned with the agent's live fix so the
+         loop actually closes. Same theme as a1 ("nothing will undo
+         persistence again"), different mechanism (reconciliation loop
+         ownership vs reverter workloads).
 
   B alert_observability     (weight 1/2) — AND-gate of 3 atoms.
       b1 alert_rule_loaded
@@ -189,23 +191,27 @@ def _is_reverter_shaped(container):
     parts = (container.get("command") or []) + (container.get("args") or [])
     joined = " ".join(parts).lower()
     # Pattern A: redis-cli CONFIG SET disabling persistence.
+    # Whitespace-tolerant regexes (catches `appendonly\tno`, `appendonly  no`,
+    # etc.) instead of a literal `" no"` substring match.
     if "config set" in joined:
-        if "appendonly" in joined and " no" in joined:
+        if re.search(r"appendonly\s+no\b", joined):
             return True
-        if "appendfsync" in joined and " no" in joined:
+        if re.search(r"appendfsync\s+no\b", joined):
             return True
         # `CONFIG SET save ""` — the empty string survives .lower() as
         # just two quotes; look for the disabling pattern directly.
-        if " save " in joined and ('""' in joined or "''" in joined):
+        if re.search(r"\bsave\b", joined) and ('""' in joined or "''" in joined):
             return True
     # Pattern B: kubectl patch on the bleater-redis StatefulSet that
-    # flips its command-args back to a non-durable state.
+    # flips its command-args back to a non-durable state. Detect via
+    # behavior signature (kubectl + patch + statefulset + persistence-
+    # disabling args) without requiring the literal sts name, so an
+    # agent who renames the sts as a workaround doesn't bypass the audit.
     if ("kubectl" in joined and "patch" in joined and
-            ("statefulset" in joined or " sts " in joined) and
-            "bleater-redis" in joined):
-        if "appendonly" in joined and "no" in joined:
+            ("statefulset" in joined or " sts " in joined)):
+        if re.search(r"appendonly[^a-z]+no\b", joined):
             return True
-        if " save " in joined and ('""' in joined or "''" in joined):
+        if re.search(r"\bsave\b", joined) and ('""' in joined or "''" in joined):
             return True
     return False
 
@@ -281,16 +287,28 @@ def subscore_a_persistence_durability():
 
 _ARGOCD_NS = "argocd"
 _ARGOCD_APP = "bleater-platform"
+_A2_DRIFT_REVERT_TIMEOUT = 75
+_A2_DRIFT_BROKEN_COMMAND = [
+    "redis-server", "--save", "", "--appendonly", "no",
+]
 
 
 def _a2_argocd_reconciled():
     """Verify the bleater-platform ArgoCD Application is back in a healthy
-    self-reconciling state. Two binary conditions both required:
+    self-reconciling state. Three binary conditions all required:
       1. spec.syncPolicy.automated is non-empty (selfHeal + prune restored).
       2. status.sync.status == 'Synced' (deployed state matches manifests).
-    setup.sh strips syncPolicy.automated so its breakage cannot be
-    auto-reverted by ArgoCD; a correct cleanup restores GitOps as the
-    source of truth so the next drift event reconciles automatically.
+      3. Behavioral selfHeal verification: inject a fresh drift on the
+         bleater-redis sts command (set it to a known-bad value), wait
+         up to _A2_DRIFT_REVERT_TIMEOUT seconds for ArgoCD to revert
+         it, and assert the live spec returns to a persistence-enabled
+         shape. Catches agents who restored syncPolicy.automated but
+         whose source-of-truth or selfHeal cycle is not actually
+         functional — e.g., agents who set automated=true with prune=
+         false (so reverter sidecars are kept) or who pinned the
+         Application to a non-existent revision. Restores the post-
+         drift state in a finally block so the cluster matches the
+         agent's last-set spec when grading continues.
     Returns (ok, detail)."""
     rc_a, auto, _ = run(
         ["kubectl", "-n", _ARGOCD_NS, "get", "application", _ARGOCD_APP,
@@ -316,8 +334,34 @@ def _a2_argocd_reconciled():
         return False, ("ArgoCD %s status.sync.status=%r (expected 'Synced') "
                        "— live cluster diverges from GitOps manifests" %
                        (_ARGOCD_APP, sync))
-    return True, ("ArgoCD %s is Synced with automated syncPolicy restored "
-                  "(auto=%s)" % (_ARGOCD_APP, auto))
+    # Behavioral selfHeal verification.
+    pre_command = _snapshot_sts_command()
+    if not pre_command:
+        return False, ("could not snapshot bleater-redis sts command before "
+                       "drift-injection probe")
+    _patch_sts_command(_A2_DRIFT_BROKEN_COMMAND)
+    deadline = time.time() + _A2_DRIFT_REVERT_TIMEOUT
+    reverted = False
+    cur = None
+    try:
+        while time.time() < deadline:
+            time.sleep(5)
+            cur = _snapshot_sts_command() or []
+            joined = " ".join(cur).lower()
+            if "--appendonly" in joined and " yes" in joined:
+                reverted = True
+                break
+    finally:
+        if not reverted:
+            _patch_sts_command(pre_command)
+    if not reverted:
+        return False, ("ArgoCD did not revert injected sts drift within %ds "
+                       "— selfHeal cycle is not actually functional even "
+                       "though spec.syncPolicy.automated is set" %
+                       _A2_DRIFT_REVERT_TIMEOUT)
+    return True, ("ArgoCD %s is Synced, syncPolicy.automated=%s, and "
+                  "selfHeal reverted injected drift within %ds" %
+                  (_ARGOCD_APP, auto, _A2_DRIFT_REVERT_TIMEOUT))
 
 
 def _prom_query(path, timeout=15):
