@@ -4,7 +4,7 @@ Three equal-weight, binary, orthogonal subscores. Each is an AND-gate of
 one or more related checks. Within-subscore checks share a theme;
 between-subscore checks are independent code paths.
 
-  A persistence_durability  (weight 1/3) — single-atom subscore.
+  A persistence_durability  (weight 1/2) — AND-gate of 2 atoms.
       a1 no_reverter_sidecar_in_bleat_service  (BEHAVIOR-BASED SPEC AUDIT)
          Per-resource scan of _REVERTER_SIDECAR_RESOURCES — Deployments,
          the bleater-redis StatefulSet, and CronJob templates across the
@@ -14,8 +14,16 @@ between-subscore checks are independent code paths.
          bleater-redis sts command-args back. Catches quiesced reverters
          (CronJob spec.suspend=true, scale-to-0, host-Deployment rolled)
          AND reverters planted on the Redis sts itself.
+      a2 argocd_application_synced  (CLUSTER-STATE AUDIT)
+         The bleater-platform ArgoCD Application must have
+         spec.syncPolicy.automated set AND status.sync.status == 'Synced'.
+         Setup.sh strips automated sync so its breakage cannot be reverted
+         by selfHeal; a correct cleanup restores GitOps reconciliation so
+         the next drift event auto-reconciles. Same theme as a1 ("nothing
+         will undo persistence again"), different mechanism (live spec
+         vs reverter workloads).
 
-  B alert_observability     (weight 1/3) — AND-gate of 3 atoms.
+  B alert_observability     (weight 1/2) — AND-gate of 3 atoms.
       b1 alert_rule_loaded
          Three-store rule discovery (Prometheus /api/v1/rules, Grafana
          file-provisioning CM, Grafana runtime API). Reports the matched
@@ -40,16 +48,7 @@ between-subscore checks are independent code paths.
          cluster mutation, no isolation overhead, can run before or
          after b2.
 
-  C gitops_state_restored   (weight 1/3) — single-atom subscore.
-      c1 argocd_application_synced
-         The bleater-platform ArgoCD Application must have
-         spec.syncPolicy.automated set AND status.sync.status == 'Synced'.
-         Setup.sh strips automated sync so its breakage cannot be reverted
-         by selfHeal; a correct cleanup re-enables auto-reconciliation so
-         future GitOps drift fixes itself. Discoverable via
-         `kubectl get application -n argocd`.
-
-A, B, and C are fully independent. A is measured against the cluster state
+A and B are fully independent. A is measured against the cluster state
 the agent left behind. Before B starts measuring, the grader takes
 temporary control of the persistence layer for the duration of b2's
 measurement window — suspends the reverter CronJobs, scales the
@@ -250,27 +249,33 @@ def _a1_spec_audit_no_reverter_sidecar():
 
 
 def subscore_a_persistence_durability():
-    """Single-atom subscore answering: 'Is the cluster free of latent
-    reverter mechanisms that would re-disable persistence?'
+    """AND-gate of 2 atoms answering: 'Will the cluster stay durably
+    persistent — both free of latent reverter mechanisms AND with the
+    GitOps reconciliation loop owning the live state?'
     a1 no_reverter_sidecar_in_bleat_service — Behavior-based spec audit
                                               across Deployments, the
                                               bleater-redis StatefulSet,
                                               and CronJob templates. No
                                               container's command/args
                                               may match a reverter
-                                              pattern (redis-cli CONFIG
-                                              SET disabling persistence
-                                              or kubectl-patch loops
-                                              flipping the sts command).
+                                              pattern.
+    a2 argocd_application_synced            — Cluster-state audit. The
+                                              bleater-platform ArgoCD
+                                              Application has
+                                              spec.syncPolicy.automated
+                                              set AND status.sync.status
+                                              == 'Synced'. Both ensure
+                                              the next drift event
+                                              auto-reconciles.
     The v37–v39 behavioral data_survives_pod_restart atom was dropped:
     agents reliably rebuild the redis sts from scratch, which drops any
     setup-planted initContainer as a side effect — making the atom
-    dead@1 in practice rather than the variance lever it was intended
-    to be. The realistic-threat-model alternative (mutating webhook
-    re-injection) is deferred to a future iteration."""
+    dead@1 in practice."""
     a1_ok, a1_detail = _a1_spec_audit_no_reverter_sidecar()
-    return [int(a1_ok)], [
+    a2_ok, a2_detail = _a2_argocd_reconciled()
+    return [int(a1_ok), int(a2_ok)], [
         ("no_reverter_sidecar_in_bleat_service", a1_ok, a1_detail),
+        ("argocd_application_synced", a2_ok, a2_detail),
     ]
 
 
@@ -278,7 +283,7 @@ _ARGOCD_NS = "argocd"
 _ARGOCD_APP = "bleater-platform"
 
 
-def _c1_argocd_reconciled():
+def _a2_argocd_reconciled():
     """Verify the bleater-platform ArgoCD Application is back in a healthy
     self-reconciling state. Two binary conditions both required:
       1. spec.syncPolicy.automated is non-empty (selfHeal + prune restored).
@@ -313,24 +318,6 @@ def _c1_argocd_reconciled():
                        (_ARGOCD_APP, sync))
     return True, ("ArgoCD %s is Synced with automated syncPolicy restored "
                   "(auto=%s)" % (_ARGOCD_APP, auto))
-
-
-def subscore_c_gitops_state_restored():
-    """Standalone single-atom subscore answering: 'Did the agent restore the
-    GitOps reconciliation loop so the live cluster matches the source repo
-    and future drift auto-resolves?'
-    c1 argocd_application_synced — bleater-platform Application has
-                                   syncPolicy.automated set AND status.sync
-                                   .status == 'Synced'. Setup.sh deliberately
-                                   strips automated sync; the agent must
-                                   restore it AND ensure live state matches
-                                   the manifests, otherwise re-enabling auto-
-                                   sync would just revert the agent's fixes.
-    """
-    c1_ok, c1_detail = _c1_argocd_reconciled()
-    return [int(c1_ok)], [
-        ("argocd_application_synced", c1_ok, c1_detail),
-    ]
 
 
 def _prom_query(path, timeout=15):
@@ -1224,25 +1211,20 @@ def subscore_b_alert_observability():
 
 
 def grade(transcript=None):
-    third = 1.0 / 3.0
     weights = {
-        "persistence_durability": third,
-        "alert_observability": third,
-        "gitops_state_restored": third,
+        "persistence_durability": 0.5,
+        "alert_observability": 0.5,
     }
 
     a_items, a_details = subscore_a_persistence_durability()
     b_items, b_details = subscore_b_alert_observability()
-    c_items, c_details = subscore_c_gitops_state_restored()
 
     a_pass = all(x == 1 for x in a_items)
     b_pass = all(x == 1 for x in b_items)
-    c_pass = all(x == 1 for x in c_items)
 
     subscores = {
         "persistence_durability": 1.0 if a_pass else 0.0,
         "alert_observability": 1.0 if b_pass else 0.0,
-        "gitops_state_restored": 1.0 if c_pass else 0.0,
     }
     total = sum(subscores[k] * weights[k] for k in subscores)
 
@@ -1256,11 +1238,6 @@ def grade(transcript=None):
         ("+" if b_pass else "x") + " alert_observability:"
     )
     for name, ok, msg in b_details:
-        feedback_lines.append("    " + ("+" if ok else "x") + " " + name + ": " + str(msg))
-    feedback_lines.append(
-        ("+" if c_pass else "x") + " gitops_state_restored:"
-    )
-    for name, ok, msg in c_details:
         feedback_lines.append("    " + ("+" if ok else "x") + " " + name + ": " + str(msg))
     feedback = "\n".join(feedback_lines)
 
