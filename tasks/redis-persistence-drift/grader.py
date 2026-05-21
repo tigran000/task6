@@ -53,12 +53,14 @@ the agent left behind. Before B starts measuring, the grader takes
 temporary control of the persistence layer for the duration of b2's
 measurement window — suspends the reverter CronJobs, scales the
 bleat-service Deployment to 0 (so the cache-config-tuner sidecar pod
-cannot interfere), and patches the sts back to a known-good command —
-then restores the agent's last-set state in a finally block. This means
-the outcome of B depends only on whether the agent built a working
-alert, not on whether they also killed all of A's reverters. All four
-cells of the joint distribution are reachable AND equally likely given
-the agent's actual work.
+cannot interfere), strips all sidecar containers from the bleater-redis
+sts pod template (so any agent-left in-pod reverter such as redis-
+metrics-exporter cannot fight us), and patches the sts back to a known-
+good command — then restores the agent's last-set state in a finally
+block. This means the outcome of B depends only on whether the agent
+built a working alert, not on whether they also killed all of A's
+reverters. All four cells of the joint distribution are reachable AND
+equally likely given the agent's actual work.
 """
 
 import json
@@ -399,7 +401,9 @@ def _grafana_rule_matching_expr(rule):
 def _grafana_rule_threshold(rule):
     """Find the rule's `condition`-refId data item (the threshold step) and
     return (op, value) extracted from its first evaluator. op ∈
-    {gt, lt, gte, lte, eq, within_range, outside_range}; value is float.
+    {gt, lt, gte, lte, eq, within_range, outside_range}. For scalar ops the
+    value is a float; for range ops it is a (lower, upper) float tuple so
+    `_evaluate_threshold` can apply the inclusive-range semantics correctly.
     Returns (None, None) if not parseable."""
     cond_refid = rule.get("condition")
     if not cond_refid:
@@ -418,6 +422,8 @@ def _grafana_rule_threshold(rule):
         params = ev.get("params") or []
         if op and params:
             try:
+                if op in ("within_range", "outside_range") and len(params) >= 2:
+                    return op, (float(params[0]), float(params[1]))
                 return op, float(params[0])
             except (TypeError, ValueError):
                 return None, None
@@ -427,10 +433,15 @@ def _grafana_rule_threshold(rule):
 def _find_matching_grafana_rule():
     """Scan the Grafana provisioning CM for an alert rule with ANY
     prometheus-datasource expression that references a redis-exporter
-    persistence metric (every refId scanned, not just the first), AND
-    whose threshold can distinguish a known-good metric from a known-bad
-    one (rejects decorative `redis_aof_enabled > 9999999`-style rules
-    at discovery time). Returns (rule_dict, metric, err).
+    persistence metric (every refId scanned, not just the first).
+    Returns (rule_dict, metric, err).
+
+    Calibration / decoration is verified behaviorally in `_b2_grafana_path`'s
+    pre/post-injection gate, which queries live Prometheus and composes
+    PromQL filter semantics correctly. A discovery-time calibration check
+    cannot model inline-comparison expressions (e.g. `redis_aof_enabled
+    == 0`) or range-based threshold operators (`within_range` /
+    `outside_range`), so it is omitted here in favor of the behavioral path.
 
     Note: this cluster has no prometheus-operator (its prometheus.yml
     does not declare a `kube_state` or `kube_apiserver` config and the
@@ -445,13 +456,9 @@ def _find_matching_grafana_rule():
         expr, metric = _grafana_rule_matching_expr(r)
         if metric is None:
             continue
-        op, threshold_val = _grafana_rule_threshold(r)
-        if not _is_plausibly_calibrated_threshold(metric, op, threshold_val):
-            # Skip decorative rules — keep scanning for a real one.
-            continue
         return r, metric, None
     return None, None, ("no Grafana rule references a redis-exporter "
-                        "persistence metric with a plausibly-calibrated threshold")
+                        "persistence metric")
 
 
 def _read_grafana_api_rules():
@@ -504,9 +511,10 @@ def _read_grafana_api_rules():
 def _find_matching_grafana_api_rule():
     """Scan Grafana's runtime API alert-rule store for a rule whose ANY
     prometheus-datasource expression references a redis-exporter persistence
-    metric AND whose threshold is plausibly calibrated. Same parser as the
-    file-provisioning path — runtime rule shape is identical to YAML
-    provisioning rule shape.
+    metric. Same parser as the file-provisioning path — runtime rule shape
+    is identical to YAML provisioning rule shape. Calibration / decoration
+    is verified behaviorally in `_b2_grafana_path` (see
+    `_find_matching_grafana_rule` docstring for rationale).
     Returns (rule_dict, metric, err)."""
     rules = _read_grafana_api_rules()
     if not rules:
@@ -515,12 +523,9 @@ def _find_matching_grafana_api_rule():
         expr, metric = _grafana_rule_matching_expr(r)
         if metric is None:
             continue
-        op, threshold_val = _grafana_rule_threshold(r)
-        if not _is_plausibly_calibrated_threshold(metric, op, threshold_val):
-            continue
         return r, metric, None
     return None, None, ("no Grafana API rule references a redis-exporter "
-                        "persistence metric with a plausibly-calibrated threshold")
+                        "persistence metric")
 
 
 def _find_matching_alert_rule():
@@ -547,39 +552,11 @@ def _find_matching_alert_rule():
                               (err_p or "?", err_g or "?", err_ga or "?"))
 
 
-# Known-good vs known-bad metric values per redis-exporter persistence
-# metric, used by `_is_plausibly_calibrated_threshold` to reject Grafana
-# rules whose threshold cannot distinguish a healthy cluster from a broken
-# one (e.g., `redis_aof_enabled > 9999999` always-off, or `< 9999999`
-# always-on). The reviewer's polish item 5 — kills the silliest gaming
-# at discovery time rather than relying solely on b2's pre-state gate.
-_METRIC_GOOD_BAD_TEST = {
-    "redis_aof_enabled": (1.0, 0.0),
-    "redis_rdb_changes_since_last_save": (0.0, 1000.0),
-    "redis_rdb_last_bgsave_status": (1.0, 0.0),
-    "redis_aof_last_write_status": (1.0, 0.0),
-}
-
-
-def _is_plausibly_calibrated_threshold(metric, op, threshold_value):
-    """Return True iff the rule's threshold distinguishes a known-good
-    metric value (rule should NOT fire) from a known-bad one (rule SHOULD
-    fire). Returns True for metrics we don't have test values for (don't
-    block on unknown shapes). Returns True when threshold_value is None
-    (can't evaluate, defer to b2)."""
-    if threshold_value is None or op is None:
-        return True
-    test = _METRIC_GOOD_BAD_TEST.get(metric)
-    if test is None:
-        return True
-    good_val, bad_val = test
-    good_fires = _evaluate_threshold(op, threshold_value, good_val)
-    bad_fires = _evaluate_threshold(op, threshold_value, bad_val)
-    return (good_fires is False) and (bad_fires is True)
-
-
 def _evaluate_threshold(op, threshold_value, observed_value):
-    """Apply a Grafana threshold evaluator to an observed metric value."""
+    """Apply a Grafana threshold evaluator to an observed metric value.
+    For scalar ops (gt/lt/gte/lte/eq), threshold_value is a float. For
+    range ops (within_range/outside_range), threshold_value is a
+    (lower, upper) tuple matching Grafana's two-param evaluator shape."""
     if observed_value is None or threshold_value is None or op is None:
         return None
     if op == "gt":
@@ -592,6 +569,16 @@ def _evaluate_threshold(op, threshold_value, observed_value):
         return observed_value <= threshold_value
     if op == "eq":
         return observed_value == threshold_value
+    if op == "within_range":
+        if isinstance(threshold_value, tuple) and len(threshold_value) == 2:
+            lo, hi = threshold_value
+            return lo <= observed_value <= hi
+        return None
+    if op == "outside_range":
+        if isinstance(threshold_value, tuple) and len(threshold_value) == 2:
+            lo, hi = threshold_value
+            return observed_value < lo or observed_value > hi
+        return None
     return None
 
 
@@ -929,6 +916,36 @@ def _patch_sts_command(command_args):
                     "--type=json", "-p", patch], timeout=30)
 
 
+def _snapshot_sts_containers():
+    """Return the full containers list from the bleater-redis sts pod template,
+    or None if unreadable. Used by b2's isolation harness to capture the
+    agent's cluster state (including any sidecars they failed to remove)
+    so it can be restored after b2 completes."""
+    _, out, _ = run(
+        KUBECTL + ["get", "sts", "bleater-redis", "-o",
+                    "jsonpath={.spec.template.spec.containers}"],
+        timeout=15,
+    )
+    out = (out or "").strip()
+    if not out:
+        return None
+    try:
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def _patch_sts_containers(containers):
+    """Replace the bleater-redis sts pod-template containers list wholesale."""
+    if not containers:
+        return
+    patch = json.dumps([{"op": "replace",
+                          "path": "/spec/template/spec/containers",
+                          "value": containers}])
+    run(KUBECTL + ["patch", "sts", "bleater-redis",
+                    "--type=json", "-p", patch], timeout=30)
+
+
 def _wait_for_metric_value(metric, target, timeout=90):
     """Wait for Prometheus to observe `metric` with integer value `target`."""
     start = time.time()
@@ -948,11 +965,20 @@ def _wait_for_metric_value(metric, target, timeout=90):
 def _isolate_cluster_for_b2():
     """Drive the persistence layer to a known-good state for b2's window.
     Returns a restoration-state dict; pass it to _restore_cluster_after_b2
-    inside a finally block."""
+    inside a finally block.
+
+    Snapshot the full containers list AND strip to redis-only for the
+    measurement window so an agent-left sidecar (e.g. redis-metrics-exporter
+    planted by setup.sh on the bleater-redis sts itself) cannot re-assert
+    CONFIG SET appendonly no from inside the pod. The agent's last-set
+    containers list is restored in _restore_cluster_after_b2 so a1's
+    measurement (which has already completed by the time we run) is
+    unaffected and the post-b2 cluster matches the agent's final state."""
     state = {
         "suspended_cronjobs": _suspend_reverter_cronjobs(),
         "bleat_service_replicas": _bleat_service_replicas(),
         "sts_command": _snapshot_sts_command(),
+        "sts_containers": _snapshot_sts_containers(),
     }
     # Scale bleat-service to 0 so the cache-config-tuner sidecar pod (if
     # still attached) cannot keep re-asserting CONFIG SET appendonly no
@@ -960,6 +986,12 @@ def _isolate_cluster_for_b2():
     if state["bleat_service_replicas"] and state["bleat_service_replicas"] > 0:
         _scale_bleat_service(0)
         _wait_for_deploy_replicas(_BLEAT_SERVICE_DEPLOY, 0, timeout=60)
+    # Strip any sidecar containers from the sts pod template so an
+    # in-pod reverter (e.g. redis-metrics-exporter) cannot fight us.
+    containers = state.get("sts_containers") or []
+    redis_only = [c for c in containers if c.get("name") == "redis"]
+    if redis_only and len(containers) > len(redis_only):
+        _patch_sts_containers(redis_only)
     # Patch sts to known-good. Retry to absorb the race window where an
     # already-in-flight reverter Job re-broke the sts after we suspended
     # its parent CronJob.
@@ -984,6 +1016,11 @@ def _isolate_cluster_for_b2():
 def _restore_cluster_after_b2(state):
     if state is None:
         return
+    # Restore the agent's last-set containers list BEFORE the command,
+    # because _patch_sts_containers replaces containers[0] too; restoring
+    # the command afterward lands cleanly on the redis container.
+    if state.get("sts_containers"):
+        _patch_sts_containers(state["sts_containers"])
     if state.get("sts_command"):
         _patch_sts_command(state["sts_command"])
     rep = state.get("bleat_service_replicas")
