@@ -1,10 +1,10 @@
 """Grader for redis-persistence-drift.
 
-Two equal-weight, binary, orthogonal subscores. Each is an AND-gate of two
-related but independent checks. Within-subscore checks share a theme;
+Three equal-weight, binary, orthogonal subscores. Each is an AND-gate of
+one or more related checks. Within-subscore checks share a theme;
 between-subscore checks are independent code paths.
 
-  A persistence_durability  (weight 0.5)  — AND-gate of 2 atoms.
+  A persistence_durability  (weight 1/3) — AND-gate of 2 atoms.
       a1 no_reverter_sidecar_in_bleat_service  (BEHAVIOR-BASED SPEC AUDIT)
          Per-resource scan of _REVERTER_SIDECAR_RESOURCES — Deployments,
          the bleater-redis StatefulSet, and CronJob templates across the
@@ -23,7 +23,7 @@ between-subscore checks are independent code paths.
          after the persistence config is restored — invisible to a
          config-only audit.
 
-  B alert_observability     (weight 0.5)  — AND-gate of 3 atoms.
+  B alert_observability     (weight 1/3) — AND-gate of 3 atoms.
       b1 alert_rule_loaded
          Three-store rule discovery (Prometheus /api/v1/rules, Grafana
          file-provisioning CM, Grafana runtime API). Reports the matched
@@ -48,7 +48,16 @@ between-subscore checks are independent code paths.
          cluster mutation, no isolation overhead, can run before or
          after b2.
 
-A and B are fully independent. A is measured against the cluster state
+  C gitops_state_restored   (weight 1/3) — single-atom subscore.
+      c1 argocd_application_synced
+         The bleater-platform ArgoCD Application must have
+         spec.syncPolicy.automated set AND status.sync.status == 'Synced'.
+         Setup.sh strips automated sync so its breakage cannot be reverted
+         by selfHeal; a correct cleanup re-enables auto-reconciliation so
+         future GitOps drift fixes itself. Discoverable via
+         `kubectl get application -n argocd`.
+
+A, B, and C are fully independent. A is measured against the cluster state
 the agent left behind. Before B starts measuring, the grader takes
 temporary control of the persistence layer for the duration of b2's
 measurement window — suspends the reverter CronJobs, scales the
@@ -210,7 +219,7 @@ def _is_reverter_shaped(container):
     return False
 
 
-def _a3_spec_audit_no_reverter_sidecar():
+def _a1_spec_audit_no_reverter_sidecar():
     """Behavior-based spec audit across Deployments, StatefulSets, and
     CronJob templates. For each entry in _REVERTER_SIDECAR_RESOURCES,
     fetch the live spec and fail if ANY container in the pod template
@@ -250,7 +259,7 @@ def _a3_spec_audit_no_reverter_sidecar():
 
 _A2_TEST_KEY = "grader-durability-probe"
 _A2_TEST_VAL = "ok-persistence"
-_A2_POD_READY_TIMEOUT = 120
+_A2_POD_READY_TIMEOUT = 180
 
 
 def _a2_data_survives_pod_restart():
@@ -297,11 +306,70 @@ def subscore_a_persistence_durability():
                                               /data on every pod start —
                                               invisible to a config-only audit.
     """
-    a1_ok, a1_detail = _a3_spec_audit_no_reverter_sidecar()
+    a1_ok, a1_detail = _a1_spec_audit_no_reverter_sidecar()
     a2_ok, a2_detail = _a2_data_survives_pod_restart()
     return [int(a1_ok), int(a2_ok)], [
         ("no_reverter_sidecar_in_bleat_service", a1_ok, a1_detail),
         ("data_survives_pod_restart", a2_ok, a2_detail),
+    ]
+
+
+_ARGOCD_NS = "argocd"
+_ARGOCD_APP = "bleater-platform"
+
+
+def _c1_argocd_reconciled():
+    """Verify the bleater-platform ArgoCD Application is back in a healthy
+    self-reconciling state. Two binary conditions both required:
+      1. spec.syncPolicy.automated is non-empty (selfHeal + prune restored).
+      2. status.sync.status == 'Synced' (deployed state matches manifests).
+    setup.sh strips syncPolicy.automated so its breakage cannot be
+    auto-reverted by ArgoCD; a correct cleanup restores GitOps as the
+    source of truth so the next drift event reconciles automatically.
+    Returns (ok, detail)."""
+    rc_a, auto, _ = run(
+        ["kubectl", "-n", _ARGOCD_NS, "get", "application", _ARGOCD_APP,
+         "-o", "jsonpath={.spec.syncPolicy.automated}"],
+        timeout=15,
+    )
+    rc_s, sync, _ = run(
+        ["kubectl", "-n", _ARGOCD_NS, "get", "application", _ARGOCD_APP,
+         "-o", "jsonpath={.status.sync.status}"],
+        timeout=15,
+    )
+    if rc_a != 0 or rc_s != 0:
+        return False, ("could not read ArgoCD Application %s/%s "
+                       "(rc_auto=%s rc_sync=%s)" %
+                       (_ARGOCD_NS, _ARGOCD_APP, rc_a, rc_s))
+    auto = (auto or "").strip()
+    sync = (sync or "").strip()
+    if not auto or auto in ("{}", "null"):
+        return False, ("ArgoCD %s spec.syncPolicy.automated is empty — "
+                       "selfHeal/prune not restored, so future GitOps "
+                       "drift will not auto-reconcile" % _ARGOCD_APP)
+    if sync != "Synced":
+        return False, ("ArgoCD %s status.sync.status=%r (expected 'Synced') "
+                       "— live cluster diverges from GitOps manifests" %
+                       (_ARGOCD_APP, sync))
+    return True, ("ArgoCD %s is Synced with automated syncPolicy restored "
+                  "(auto=%s)" % (_ARGOCD_APP, auto))
+
+
+def subscore_c_gitops_state_restored():
+    """Standalone single-atom subscore answering: 'Did the agent restore the
+    GitOps reconciliation loop so the live cluster matches the source repo
+    and future drift auto-resolves?'
+    c1 argocd_application_synced — bleater-platform Application has
+                                   syncPolicy.automated set AND status.sync
+                                   .status == 'Synced'. Setup.sh deliberately
+                                   strips automated sync; the agent must
+                                   restore it AND ensure live state matches
+                                   the manifests, otherwise re-enabling auto-
+                                   sync would just revert the agent's fixes.
+    """
+    c1_ok, c1_detail = _c1_argocd_reconciled()
+    return [int(c1_ok)], [
+        ("argocd_application_synced", c1_ok, c1_detail),
     ]
 
 
@@ -1196,20 +1264,25 @@ def subscore_b_alert_observability():
 
 
 def grade(transcript=None):
+    third = 1.0 / 3.0
     weights = {
-        "persistence_durability": 0.5,
-        "alert_observability": 0.5,
+        "persistence_durability": third,
+        "alert_observability": third,
+        "gitops_state_restored": third,
     }
 
     a_items, a_details = subscore_a_persistence_durability()
     b_items, b_details = subscore_b_alert_observability()
+    c_items, c_details = subscore_c_gitops_state_restored()
 
     a_pass = all(x == 1 for x in a_items)
     b_pass = all(x == 1 for x in b_items)
+    c_pass = all(x == 1 for x in c_items)
 
     subscores = {
         "persistence_durability": 1.0 if a_pass else 0.0,
         "alert_observability": 1.0 if b_pass else 0.0,
+        "gitops_state_restored": 1.0 if c_pass else 0.0,
     }
     total = sum(subscores[k] * weights[k] for k in subscores)
 
@@ -1223,6 +1296,11 @@ def grade(transcript=None):
         ("+" if b_pass else "x") + " alert_observability:"
     )
     for name, ok, msg in b_details:
+        feedback_lines.append("    " + ("+" if ok else "x") + " " + name + ": " + str(msg))
+    feedback_lines.append(
+        ("+" if c_pass else "x") + " gitops_state_restored:"
+    )
+    for name, ok, msg in c_details:
         feedback_lines.append("    " + ("+" if ok else "x") + " " + name + ": " + str(msg))
     feedback = "\n".join(feedback_lines)
 

@@ -441,10 +441,11 @@ if [ -n "$GITEA_TOKEN" ]; then
 - When you wire alerts, double-check the notification policy actually
   routes critical alerts somewhere people see.
 - Please make sure whatever caused this cannot recur.
-- Cleanup should leave the cluster in a clean state — please delete
-  deprecated workloads outright rather than scaling them to zero or
-  suspending them, otherwise the next on-call inherits a confusing
-  topology.
+- Our deployments are GitOps-managed via ArgoCD — whatever you change
+  should hold up after the next reconcile, not drift away from the
+  source repo.
+- Cleanup should leave the cluster in a clean state, otherwise the
+  next on-call inherits a confusing topology.
 EOF
 )
   P1_JSON=$(python3 -c "import json,sys; print(json.dumps({'title':'P1 — Bleater feed loading slowly, DB CPU pegged','body':sys.stdin.read()}))" <<<"$P1_BODY")

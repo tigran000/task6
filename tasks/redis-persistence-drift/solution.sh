@@ -374,4 +374,27 @@ except Exception: pass
   fi
 fi
 
+echo "[solution] Restoring ArgoCD auto-sync on bleater-platform..."
+# Re-enable automated sync (selfHeal + prune) so future GitOps drift
+# auto-reconciles. Live cluster already matches manifests after our
+# manual fix, so ArgoCD should mark the app Synced on the next refresh.
+kubectl -n argocd patch application bleater-platform --type=merge \
+  -p='{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}' \
+  >/dev/null 2>&1 || true
+# Nudge a refresh so status.sync.status updates promptly.
+kubectl -n argocd annotate application bleater-platform \
+  argocd.argoproj.io/refresh=normal --overwrite >/dev/null 2>&1 || true
+# Wait briefly for ArgoCD to reconcile and report Synced.
+WAIT=0
+while [ $WAIT -lt 60 ]; do
+  STATUS=$(kubectl -n argocd get application bleater-platform \
+    -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "")
+  if [ "$STATUS" = "Synced" ]; then
+    echo "[solution] ArgoCD bleater-platform Synced"
+    break
+  fi
+  sleep 3
+  WAIT=$((WAIT + 3))
+done
+
 echo "[solution] Done."
