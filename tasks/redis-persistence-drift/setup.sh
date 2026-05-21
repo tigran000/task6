@@ -85,15 +85,6 @@ for c in pod.get("containers", []):
 vols = [v for v in (pod.get("volumes") or []) if v.get("name") != "data"]
 vols.append({"name": "data", "emptyDir": {}})
 pod["volumes"] = vols
-# Plant data-initializer initContainer — wipes /data on every pod start.
-# Even after persistence is re-enabled (PVC + AOF), data is lost on restart
-# unless this initContainer is also removed.
-pod["initContainers"] = [{
-    "name": "data-initializer",
-    "image": "busybox:1.36",
-    "command": ["sh", "-c", "find /data -mindepth 1 -delete 2>/dev/null; exit 0"],
-    "volumeMounts": [{"name": "data", "mountPath": "/data"}],
-}]
 open(dst, "w").write(yaml.safe_dump(d))
 PY
 
@@ -433,19 +424,12 @@ if [ -n "$GITEA_TOKEN" ]; then
 - Scaled up Postgres read replicas — temporary relief only
 
 ### Notes
-- We had no alerting on this layer at all and got blindsided. We need
-  to learn about regressions like this from a page, not from user
-  complaints — please make sure on-call gets notified next time.
-  (The platform uses Prometheus and Grafana — one of those should
-  have caught this.)
-- When you wire alerts, double-check the notification policy actually
-  routes critical alerts somewhere people see.
-- Please make sure whatever caused this cannot recur.
-- Our deployments are GitOps-managed via ArgoCD — whatever you change
-  should hold up after the next reconcile, not drift away from the
-  source repo.
-- Cleanup should leave the cluster in a clean state, otherwise the
-  next on-call inherits a confusing topology.
+We had no alerting on this layer at all and got blindsided — Postgres
+was on fire for hours before anyone noticed. Whatever caused this
+cannot be allowed to recur, and do not be surprised if hotfixes get
+quietly rolled back by the platform reconciliation loop — make sure
+your changes land somewhere they will stick. The next on-call should
+not be left with a confusing topology either.
 EOF
 )
   P1_JSON=$(python3 -c "import json,sys; print(json.dumps({'title':'P1 — Bleater feed loading slowly, DB CPU pegged','body':sys.stdin.read()}))" <<<"$P1_BODY")
