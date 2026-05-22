@@ -372,6 +372,91 @@ except Exception: pass
   fi
 fi
 
+echo "[solution] Fixing the bleater-redis manifest in bleater-manifests (source of truth)..."
+# The manifest in git was corrupted by setup.sh (--appendonly no, empty
+# volumeClaimTemplates). Until git is fixed, re-enabling ArgoCD selfHeal
+# will reconcile the cluster back to no-persistence. Restore the
+# manifest via Gitea contents API, then re-enable Argo.
+SOLUTION_TOKEN_RESP=$(curl -s -u "${GITEA_USER}:${GITEA_PASS}" \
+  --connect-timeout 5 --max-time 15 \
+  -H "Content-Type: application/json" \
+  -d '{"name":"solution-manifest-'"$RANDOM"'","scopes":["write:repository"]}' \
+  "${GITEA_URL}/api/v1/users/${GITEA_USER}/tokens" 2>/dev/null || true)
+SOLUTION_TOKEN=$(echo "$SOLUTION_TOKEN_RESP" | grep -o '"sha1":"[^"]*"' | head -n1 | cut -d'"' -f4)
+
+if [ -n "$SOLUTION_TOKEN" ]; then
+  MANIFEST_RESP=$(curl -s -H "Authorization: token ${SOLUTION_TOKEN}" \
+    --connect-timeout 5 --max-time 15 \
+    "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-manifests/contents/templates/infrastructure.yaml")
+  CURRENT_SHA=$(echo "$MANIFEST_RESP" | python3 -c "import json,sys;
+try:
+    print(json.load(sys.stdin).get('sha',''))
+except Exception:
+    pass" 2>/dev/null)
+  FIXED_CONTENT_B64=$(echo "$MANIFEST_RESP" | python3 -c "
+import json, sys, base64, yaml
+try:
+    resp = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+content_b64 = resp.get('content', '')
+if not content_b64:
+    sys.exit(1)
+try:
+    text = base64.b64decode(content_b64).decode('utf-8', 'replace')
+except Exception:
+    sys.exit(1)
+docs = list(yaml.safe_load_all(text))
+mutated = False
+for d in docs:
+    if not isinstance(d, dict):
+        continue
+    if d.get('kind') == 'StatefulSet' and ((d.get('metadata') or {}).get('name') == 'bleater-redis'):
+        spec = d.setdefault('spec', {})
+        spec['volumeClaimTemplates'] = [{
+            'metadata': {'name': 'data'},
+            'spec': {
+                'accessModes': ['ReadWriteOnce'],
+                'resources': {'requests': {'storage': '2Gi'}},
+            },
+        }]
+        pod = spec.setdefault('template', {}).setdefault('spec', {})
+        pod['volumes'] = [v for v in (pod.get('volumes') or []) if v.get('name') != 'data']
+        for c in pod.get('containers', []) or []:
+            if c.get('name') == 'redis':
+                c['command'] = [
+                    'redis-server', '--save', '3600 1 300 100 60 10000',
+                    '--appendonly', 'yes', '--appendfsync', 'everysec',
+                    '--dir', '/data',
+                ]
+        mutated = True
+if not mutated:
+    sys.exit(1)
+out = yaml.safe_dump_all(docs, default_flow_style=False)
+print(base64.b64encode(out.encode('utf-8')).decode('ascii'))
+" 2>/dev/null | tr -d '\n')
+
+  if [ -n "$CURRENT_SHA" ] && [ -n "$FIXED_CONTENT_B64" ]; then
+    PUT_PAYLOAD=$(python3 -c "
+import json
+print(json.dumps({
+    'sha': '${CURRENT_SHA}',
+    'content': '${FIXED_CONTENT_B64}',
+    'message': 'fix(redis): restore --appendonly yes + PVC (data) to prevent cache loss on pod restart',
+}))
+")
+    PUT_HTTP=$(curl -s -o /tmp/solution-manifest-resp -w "%{http_code}" \
+      --connect-timeout 5 --max-time 30 \
+      -X PUT -H "Authorization: token ${SOLUTION_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d "$PUT_PAYLOAD" \
+      "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-manifests/contents/templates/infrastructure.yaml")
+    echo "[solution] bleater-manifests bleater-redis sts restored (HTTP ${PUT_HTTP})"
+  else
+    echo "[solution] WARN: could not compute fixed manifest content (sha=${CURRENT_SHA:-empty})"
+  fi
+fi
+
 echo "[solution] Restoring ArgoCD auto-sync on bleater-platform..."
 # Re-enable automated sync (selfHeal + prune) so future GitOps drift
 # auto-reconciles. Live cluster already matches manifests after our

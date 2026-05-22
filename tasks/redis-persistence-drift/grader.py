@@ -1,10 +1,10 @@
 """Grader for redis-persistence-drift.
 
-Three equal-weight, binary, orthogonal subscores. Each is an AND-gate of
+Two equal-weight, binary, orthogonal subscores. Each is an AND-gate of
 one or more related checks. Within-subscore checks share a theme;
 between-subscore checks are independent code paths.
 
-  A persistence_durability  (weight 1/2) — AND-gate of 2 atoms.
+  A persistence_durability  (weight 1/2) — AND-gate of 3 atoms.
       a1 no_reverter_sidecar_in_bleat_service  (BEHAVIOR-BASED SPEC AUDIT)
          Per-resource scan of _REVERTER_SIDECAR_RESOURCES — Deployments,
          the bleater-redis StatefulSet, and CronJob templates across the
@@ -24,6 +24,19 @@ between-subscore checks are independent code paths.
          unowned by the Application — they linger across the next
          reconcile. Setup.sh strips automated sync entirely; a correct
          cleanup restores both flags.
+      a3 source_repo_aligned  (GITOPS SOURCE-OF-TRUTH AUDIT)
+         The bleater-redis StatefulSet manifest inside the bleater-
+         manifests Gitea repo (which ArgoCD pulls from) must have
+         --appendonly yes AND a non-empty volumeClaimTemplates entry
+         named 'data'. Setup.sh corrupts this file in master so that
+         agents who only fix the LIVE cluster leave a time bomb: the
+         moment ArgoCD selfHeal reconciles from the still-broken
+         manifest, the cluster regresses. The "hotfixes get quietly
+         rolled back by the platform reconciliation loop — make sure
+         your changes land somewhere they will stick" hint in the P1
+         body is the symptom-level pointer for this atom; agents who
+         miss the git-vs-live distinction fail here regardless of how
+         well they cleaned the cluster.
 
   B alert_observability     (weight 1/2) — AND-gate of 3 atoms.
       b1 alert_rule_loaded
@@ -220,8 +233,8 @@ def _a1_spec_audit_no_reverter_sidecar():
     looks like a reverter. Resources entirely deleted count as PASS.
     Catches:
       - quiesced reverters (CronJob spec.suspend=true) the live poll misses
-      - reverters planted on the Redis sts itself (added in v31 — the
-        previous Deployment-only audit was blind to this placement)
+      - reverters planted on the Redis sts itself (covers the
+        StatefulSet container list directly, not only Deployments)
       - kubectl-patch-shaped watchdog containers (catches redis-config-
         watchdog in its CronJob jobTemplate)
     """
@@ -252,9 +265,10 @@ def _a1_spec_audit_no_reverter_sidecar():
 
 
 def subscore_a_persistence_durability():
-    """AND-gate of 2 atoms answering: 'Will the cluster stay durably
-    persistent — both free of latent reverter mechanisms AND with the
-    GitOps reconciliation loop owning the live state?'
+    """AND-gate of 3 atoms answering: 'Will the cluster stay durably
+    persistent — free of latent reverter mechanisms, with the GitOps
+    reconciliation loop owning the live state, AND with the source-of-
+    truth manifest matching the desired persistent shape?'
     a1 no_reverter_sidecar_in_bleat_service — Behavior-based spec audit
                                               across Deployments, the
                                               bleater-redis StatefulSet,
@@ -270,15 +284,32 @@ def subscore_a_persistence_durability():
                                               == 'Synced'. Both ensure
                                               the next drift event
                                               auto-reconciles.
-    The v37–v39 behavioral data_survives_pod_restart atom was dropped:
+    a3 source_repo_aligned                  — GitOps source-of-truth
+                                              audit. The bleater-redis
+                                              StatefulSet manifest in
+                                              bleater-manifests
+                                              (templates/infrastructure.
+                                              yaml) has --appendonly yes
+                                              AND non-empty
+                                              volumeClaimTemplates named
+                                              'data'. Catches agents
+                                              who fix only the live
+                                              cluster while leaving the
+                                              git manifest corrupted —
+                                              ArgoCD selfHeal would
+                                              regress them on next
+                                              reconcile.
+    A prior behavioral data_survives_pod_restart atom was dropped:
     agents reliably rebuild the redis sts from scratch, which drops any
-    setup-planted initContainer as a side effect — making the atom
-    dead@1 in practice."""
+    setup-planted initContainer as a side effect — saturating the atom
+    in practice."""
     a1_ok, a1_detail = _a1_spec_audit_no_reverter_sidecar()
     a2_ok, a2_detail = _a2_argocd_reconciled()
-    return [int(a1_ok), int(a2_ok)], [
+    a3_ok, a3_detail = _a3_source_repo_aligned()
+    return [int(a1_ok), int(a2_ok), int(a3_ok)], [
         ("no_reverter_sidecar_in_bleat_service", a1_ok, a1_detail),
         ("argocd_application_synced", a2_ok, a2_detail),
+        ("source_repo_aligned", a3_ok, a3_detail),
     ]
 
 
@@ -334,6 +365,121 @@ def _a2_argocd_reconciled():
                        (_ARGOCD_APP, sync))
     return True, ("ArgoCD %s is Synced with selfHeal=true AND prune=true" %
                   _ARGOCD_APP)
+
+
+_GITEA_BASE = "http://gitea.devops.local:3000"
+_GITEA_USER = "root"
+_GITEA_PASS = "Admin@123456"
+_MANIFEST_REPO = "bleater-manifests"
+_MANIFEST_PATH = "templates/infrastructure.yaml"
+
+
+def _a3_source_repo_aligned():
+    """Verify the bleater-redis StatefulSet manifest inside the
+    bleater-manifests Gitea repo (the chart ArgoCD pulls from) has
+    persistence enabled. Setup.sh corrupts this file to --appendonly no
+    + empty volumeClaimTemplates; a correct fix must commit a restored
+    manifest back to master, otherwise ArgoCD selfHeal will reconcile
+    the cluster back to the broken shape on the next refresh.
+
+    Two binary conditions all required (read from the file in master,
+    not the live cluster):
+      1. The redis container's command/args has --appendonly yes AND
+         does NOT have --appendonly no or --save "".
+      2. spec.volumeClaimTemplates contains an entry named 'data'
+         (no entry == emptyDir == ephemeral cache).
+
+    Uses HTTP Basic auth against the Gitea contents API. The file
+    response shape is {"sha": "...", "content": "<base64>", ...}.
+
+    Returns (ok, detail)."""
+    import base64
+    cmd = ["curl", "-s", "--connect-timeout", "5", "--max-time", "20",
+           "-u", "%s:%s" % (_GITEA_USER, _GITEA_PASS),
+           "%s/api/v1/repos/%s/%s/contents/%s" % (
+               _GITEA_BASE, _GITEA_USER, _MANIFEST_REPO, _MANIFEST_PATH)]
+    rc, out, _ = run(cmd, timeout=30)
+    if rc != 0 or not out:
+        return False, ("could not fetch %s from %s/%s via Gitea API (rc=%s)" %
+                       (_MANIFEST_PATH, _GITEA_USER, _MANIFEST_REPO, rc))
+    try:
+        resp = json.loads(out)
+    except Exception:
+        return False, ("Gitea API returned non-JSON for %s" % _MANIFEST_PATH)
+    content_b64 = resp.get("content", "")
+    if not content_b64:
+        return False, ("Gitea API response missing 'content' for %s "
+                       "(repo or path may not exist)" % _MANIFEST_PATH)
+    try:
+        text = base64.b64decode(content_b64).decode("utf-8", "replace")
+    except Exception:
+        return False, ("templates/infrastructure.yaml content_base64 "
+                       "could not be decoded")
+    try:
+        import yaml
+    except Exception:
+        return False, "yaml module unavailable in grader environment"
+    try:
+        docs = list(yaml.safe_load_all(text))
+    except Exception as e:
+        return False, ("%s in git is not valid YAML: %s" %
+                       (_MANIFEST_PATH, e))
+    sts = None
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        if (doc.get("kind") == "StatefulSet"
+                and (doc.get("metadata") or {}).get("name") == "bleater-redis"):
+            sts = doc
+            break
+    if sts is None:
+        return False, ("%s in git has no StatefulSet named bleater-redis "
+                       "(file may have been deleted or renamed)" % _MANIFEST_PATH)
+    spec = sts.get("spec") or {}
+    containers = (((spec.get("template") or {}).get("spec") or {})
+                  .get("containers") or [])
+    redis_c = next((c for c in containers if c.get("name") == "redis"), None)
+    if redis_c is None:
+        return False, ("bleater-redis StatefulSet in git has no container "
+                       "named 'redis'")
+    cmd_args = ((redis_c.get("command") or []) +
+                (redis_c.get("args") or []))
+    # List-position check: redis-server CLI uses positional pairs like
+    # ['--save', ''] and ['--appendonly', 'no'] / ['--appendonly', 'yes'].
+    # Joining-and-regex misses the empty-string case because the quotes
+    # are YAML-level (the parser strips them). Scan pairs instead.
+    appendonly_value = None
+    save_value = None
+    for i, arg in enumerate(cmd_args):
+        token = str(arg).strip().lower()
+        if token == "--appendonly" and i + 1 < len(cmd_args):
+            appendonly_value = str(cmd_args[i + 1]).strip().lower()
+        elif token == "--save" and i + 1 < len(cmd_args):
+            save_value = str(cmd_args[i + 1]).strip()
+    if appendonly_value == "no":
+        return False, ("bleater-redis StatefulSet in git still has "
+                       "--appendonly no — live cluster will regress "
+                       "to no-AOF on next ArgoCD reconcile (command=%r)"
+                       % cmd_args)
+    if save_value is not None and save_value in ("", '""', "''"):
+        return False, ("bleater-redis StatefulSet in git still has "
+                       "--save \"\" — RDB snapshots disabled at the "
+                       "source (command=%r)" % cmd_args)
+    if appendonly_value != "yes":
+        return False, ("bleater-redis StatefulSet in git command does "
+                       "not enable --appendonly yes (saw appendonly=%r, "
+                       "command=%r)" % (appendonly_value, cmd_args))
+    vcts = spec.get("volumeClaimTemplates") or []
+    data_pvc = next((v for v in vcts
+                     if (v.get("metadata") or {}).get("name") == "data"),
+                    None)
+    if data_pvc is None:
+        return False, ("bleater-redis StatefulSet in git has no "
+                       "volumeClaimTemplate named 'data' — emptyDir "
+                       "leaves the cache ephemeral across pod restarts")
+    return True, ("bleater-redis manifest in %s/%s is correct "
+                  "(--appendonly yes + PVC named 'data')" %
+                  (_MANIFEST_REPO, _MANIFEST_PATH))
 
 
 def _prom_query(path, timeout=15):

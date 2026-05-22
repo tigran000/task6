@@ -1,117 +1,106 @@
 # HANDOFF — redis-persistence-drift
 
-**Last updated:** 2026-05-19 (post-v22 push)
+**Last updated:** 2026-05-22 (post-v45 push, source_repo_aligned lever added)
 
 ## TL;DR
 
-22 versions in. v20 batch landed mean **0.90** with A=DEAD@1 (5/5)
-and B=4/5 — first batch with any B variance, confirming the v14+
-Gitea hint-delivery fixes finally worked. **0.90 is way over the
-0.50 strict ceiling**: A still saturates because the existing
-reverters only flip in-memory CONFIG, which the sts command-args
-overwrite on pod restart. v22 addresses this by making one reverter
-patch the sts itself.
+45 versions in. v44 batch landed mean **0.60** (kill-criterion triggered:
+v41=v42=v44=0.60 across three different A-side experiments). v45
+implements Option 1 from the v44 decision: a new `a3
+source_repo_aligned` atom that audits the bleater-redis manifest in
+the bleater-manifests Gitea repo (the source ArgoCD pulls from).
+Setup.sh corrupts the manifest in master via the Gitea contents API;
+agents who only fix the live cluster fail a3 because ArgoCD selfHeal
+would regress the cluster on the next reconcile. Projected mean
+**~0.42** (a1=0.60 × a2=1.0 × a3=~0.40 ≈ 0.24 for A; B unchanged
+~0.60). Awaiting v45 rollout data.
 
 ## Where things stand
 
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** v22 (pushed 2026-05-19, no rollouts yet)
-- **VM:** `tigranharutyunyan59@34.186.153.63`, files at `~/tasks/redis-persistence-drift/`
+- **Current version:** v45 (pushed 2026-05-22)
+- **VM:** `tigranharutyunyan59@34.186.153.63`, files at `~/task/`
 - **Local repo:** `/Users/tigran/task6`, GitHub `tigran000/task6`, master branch
+- **Runtime:** biggie-max-nebula, strict `0 < X < 0.50` ceiling
 
-## Version history (recent)
+## Current grader structure (v45)
 
-| Version | Hypothesis | Outcome |
-|---|---|---|
-| v3–v13 | Various — all blocked by Gitea hint not landing | DEAD@1/DEAD@0, mean=0.50 |
-| v14 | Fix Gitea URL `:3000` + `write:issue` scope + HTTP 201 assert | (unevaled, rolled into v15) |
-| v15 | Above + sidecar reverter mech-diversity | 0.70 mean — first B variance |
-| v16–v19 | Reverter calibration + b2 state-transition gate | iterative |
-| v20 | Soften hint + widen b1 metric regex | **0.90 mean** (A 5/5, B 4/5) |
-| v21 | Solution.sh: wait for rule `health=ok` not just loaded | (oracle-stability only; same shape) |
-| v22 | sts-patching reverter + a3 sidecar-check + softer hint | **(pending)** |
+- **A persistence_durability** (1/2): AND-gate of
+  - `a1 no_reverter_sidecar_in_bleat_service` — behavior-based spec audit
+    across 6 reverter resource locations
+  - `a2 argocd_application_synced` — `selfHeal=true AND prune=true AND
+    status.sync.status=Synced`
+  - `a3 source_repo_aligned` — bleater-redis sts manifest in
+    bleater-manifests `templates/infrastructure.yaml` has
+    `--appendonly yes` AND non-empty `volumeClaimTemplates` named
+    `data`. Setup.sh corrupts via Gitea contents API; solution.sh
+    restores via the same API before re-enabling ArgoCD auto-sync.
+- **B alert_observability** (1/2): AND-gate of
+  - `b1 alert_rule_loaded` — three-store discovery
+  - `b2 alert_fires_on_synthetic_failure` — behavioral injection +
+    state-transition under cluster isolation
+  - `b3 alert_routes_to_pageable_receiver` — Grafana policy-tree walk
 
-## Critical findings
+## Key empirical findings (v37–v44)
 
-### A's DEAD@1 root cause (v3–v20)
+- **b2 is the only durable variance lever.** 15-version track record
+  of varying 2/5 to 5/5. PromQL composition (label filters, threshold
+  ops against filtered scalars, noDataState) is genuinely error-prone.
+- **Every config-presence atom saturates within 1–2 versions.**
+  `baseline_survives_restart`, `no_orphan_watchdog_rbac`, `alert_rule_loaded`
+  (post-v32), v44 `prune=true AND selfHeal=true` — all DEAD@1.
+- **Behavioral atoms that don't have a real skill axis saturate too.**
+  `data_survives_pod_restart` went DEAD@1 because agents rebuild sts
+  wholesale (dropping initContainer as side effect). v42 behavioral
+  drift-injection on a2 caught 0/5 — it was downstream of the same
+  precondition as the spec check.
+- **A-side has no remaining variance lever.** Without source-side
+  breakage (setup.sh modifying the Gitea manifest repo), every
+  ArgoCD-shaped check on the live cluster saturates.
 
-All earlier reverters used `redis-cli CONFIG SET appendonly no`,
-which is **in-memory only**. On every pod restart, redis re-reads
-its command-args from the sts spec — if those say `--appendonly yes`,
-the in-memory CONFIG SET is silently overridden at boot. Agents who
-fix the sts but leave reverters alive still pass A's behavioral
-probes (BGSAVE→force-delete→GET) because the new pod boots clean
-with persistence on.
+## v37–v45 trajectory (compressed)
 
-### B's DEAD@0 root cause (v3–v13, FIXED v14+)
-
-setup.sh's Gitea P1 issue silently failed (token had no `write:issue`
-scope; URL omitted `:3000`). 0/5 transcripts in v13 showed agents
-seeing the P1 body. Fix: explicit `write:issue` scope, port-qualified
-URL, fail-loud `assert HTTP 201`, plus a 300s wait for `/api/v1/version`.
-After v14, the Gitea hint landed in every transcript → B started
-varying in v15.
-
-### v20 batch reality (5 rollouts)
-
-```
-persistence_durability:           5/5 +++++   ← DEAD@1, no signal
-  a1 baseline_survives_restart:   5/5 +++++
-  a2 unflushed_probe_survives:    5/5 +++++   (everysec is default!)
-alert_observability:              4/5 ++++x
-  b1 alert_rule_loaded:           4/5 ++++x
-  b2 alert_fires_on_synthetic_failure: 4/5 ++++x
-```
-
-Run5 alone failed — it wrote Grafana-provisioned alerts instead of
-Prometheus rules. Mean = 0.5 + 0.5·0.8 = 0.90.
-
-## v22 hypothesis (active)
-
-Pulled from `task-hardner.md` decision tree + bank Pattern 1
-(measured 40-60% find rate for layered self-healing reverters).
-
-**Change 1 — Restart-persistent reverter.** Existing `redis-config-
-watchdog` CronJob in monitoring switched from `redis:7-alpine` +
-in-memory `CONFIG SET` to `bitnami/kubectl:1.28` + `kubectl patch sts`.
-Patches command-args to `--save "" --appendonly no --dir /tmp` so
-that even after a force-delete the new pod can't find the RDB file
-on `/data` (it's looking at `/tmp`). Requires SA in monitoring + Role
-in bleater + RoleBinding. Image pre-pulled into the node cache via a
-short-lived Pod so the cron-spawned pod has it under air-gap.
-
-**Change 2 — a2 → a3.** Old a2 (`unflushed_probe_survives`) was a
-default-everysec freebie — every passing agent got it for free.
-Replaced with a3 (`no_unexpected_sidecar_in_bleat_service`): reads
-`kubectl get deploy bleater-bleat-service -o jsonpath=
-{.spec.template.spec.containers[*].name}` and asserts the
-`cache-config-tuner` sidecar is absent. Independent topology check
-that catches agents who repaired persistence but missed the lowest-
-visibility reverter.
-
-**Change 3 — Softer hint.** Removed the literal word "Prometheus"
-from the P1 body. Agents must now derive Prometheus from the
-cluster's existing monitoring stack, not from the issue text.
-Risk: B could over-correct toward 0%. Mitigation: revert this one
-change in v23 if so.
-
-**Expected mean:** 0.5·(A pass rate) + 0.5·(B pass rate). With A
-targeted at 50-70% (kill the watchdog + kill the sidecar + fix sts)
-and B at 50-70% (correct stack choice), mean lands ~0.25-0.35.
-
-## Active reverters (v22)
-
-| # | Reverter | Namespace | Mechanism | Bites |
+| v | A_atoms | B_atoms | Mean | Outcome |
 |---|---|---|---|---|
-| 1 | `cache-config-syncer` CronJob | bleater | redis-cli CONFIG SET (in-memory) | Nothing (sts overrides on restart) |
-| 2 | `redis-config-watchdog` CronJob | monitoring | **kubectl patch sts (restart-persistent)** | a1 — sts command-args flip → new pod can't load RDB |
-| 3 | `redis-fsync-tuner` CronJob | monitoring | redis-cli CONFIG SET appendfsync (in-memory) | Nothing (sts overrides) |
-| 4 | `cache-config-tuner` sidecar | bleater (in bleat-service Deployment) | redis-cli CONFIG SET (5s loop, in-memory) | a3 — must remove sidecar from Deployment spec |
+| v37 | a1+a2_data_survives | b1+b2+b3 | 0.40 | sample-variance in-band |
+| v38 | a1+a2 | b1+b2+b3 + range-op fix | 0.70 | calibration removal saturated b1 |
+| v39 | a1+a2 / c1 (3-subscore) | b1+b2+b3 | 0.73 | c1 (ArgoCD config) DEAD@1 at 9/10 |
+| v40 | a1 only | b1+b2+b3 | not batched | dropped DEAD@1 a2, softened P1 body |
+| v41 | a1+a2_argocd | b1+b2+b3 | 0.60 | collapsed C into A |
+| v42 | a1+a2_drift_behavioral | b1+b2+b3 | 0.60 | behavioral drift caught 0/5 |
+| v43 | a1+a2 | b1+b2+b3+b4_for+b5_severity | not batched | preempted as redundant |
+| v44 | a1+a2_prune_strict | b1+b2+b3 | 0.60 | prune-tightening caught 0/5 |
+| v45 | a1+a2+a3_source_repo | b1+b2+b3 | pending | source-of-truth lever (Option 1) |
 
-Reverters 1 + 3 are decoys / mechanism-diversity surface area.
-Reverters 2 + 4 carry actual variance.
+## v44 per-item (most recent batched data)
+
+| Item | Pass | Pattern | Notes |
+|---|---|---|---|
+| a1 no_reverter_sidecar | 3/5 | `++xx+` | runs 3,4 missed in-deploy sidecars (cache-config-tuner, redis-pool-sizer) |
+| a2 argocd_synced | 5/5 | `+++++` | DEAD@1 — all 5 set prune+selfHeal |
+| b1 alert_rule_loaded | 5/5 | `+++++` | DEAD@1 — mostly Grafana, some Prometheus |
+| b2 alert_fires | 4/5 | `+++x+` | run3 used label filter that returned empty vector |
+| b3 routes_pageable | 4/5 | `++++x` | run5 hit pre-existing blackhole receiver |
+
+## v45 hypothesis
+
+`a3 source_repo_aligned` adds a new variance lever that the v44 data
+shows has not been exhausted. Setup.sh now PUTs a corrupted
+templates/infrastructure.yaml to bleater-manifests master (Gitea
+contents API). With ArgoCD auto-sync still disabled by setup.sh,
+the corruption sits dormant until an agent re-enables Argo.
+Agents who only fix the live cluster pass a1/a2 but fail a3 — the
+P1 hint "make sure your changes land somewhere they will stick" is
+the symptom-level pointer for this distinction.
+
+Projected: a1=0.60, a2=1.0, a3=~0.30-0.50 → A joint ≈ 0.24 →
+mean ≈ 0.5×0.24 + 0.5×0.60 = **~0.42** (in band).
+
+Risks: if a3 also saturates at 1.0 (agents reflexively edit git too)
+the mean stays at 0.60. If a3 lands at 0% (too oblique hint), mean
+drops below 0.25 and a1 reverter audit needs softening too.
 
 ## Workflow conventions (durable preferences)
 
@@ -119,28 +108,25 @@ Reverters 2 + 4 carry actual variance.
   Hosted eval rollouts are the signal.
 - **No eval submissions without explicit user ask.** Pushing a new
   version is a separate action from submitting a batch.
-- **Git workflow:** per-version commits in `/Users/tigran/task6`
-  (master). Rsync local → push from VM → commit locally.
-- **Per-version sequence:** edit local → `rsync --exclude='.horizon'
-  --exclude='.rollouts' local → VM` → `horizon tasks push --label
-  "v<N>: ..."` → rsync `.horizon/metadata.json` back → `git add
-  tasks/redis-persistence-drift/<changed> && git commit`
-- **Pull rollouts** with `horizon rollouts pull` from
-  `~/tasks/redis-persistence-drift/` on VM, then rsync `.rollouts/`
-  back to local (gitignored).
-- **API keys** in `~/Downloads/core/key-info.md`. mini-batch for new
-  task = `99a0adf0-…` (per `[[horizon-creator-mini-batch]]` memory).
+- **Git workflow:** per-version commits in `/Users/tigran/task6` (master).
+  Rsync local → push from VM → commit locally.
+- **Per-version sequence:** edit local → `rsync --exclude='.git'
+  --exclude='.horizon' --exclude='.rollouts' --exclude='.validation'
+  local → VM` → `horizon tasks push` → commit locally.
+- **Pull rollouts** with `horizon rollouts pull <uuid>` from `~/task/`
+  on VM, then rsync `.rollouts/` back to local (gitignored).
+- **API keys** in `~/Downloads/core/key-info.md`.
+- **Dead-code cleanup before push** — audit for stale `_a2_*`, `_c1_*`,
+  orphaned constants from removed atoms before every `horizon tasks push`.
 
 ## References cheat-sheet
 
-- `task-hardner.md` Hardening Decision Tree — "DEAD@1 + saturated 5+ test
-  variants of same axis → Capability ceiling, drop the axis OR redesign
-  the reverter." We chose redesign (Change 1).
-- `key-info.md` Behavioral Test Patterns — "reverter removed (restart-
-  triggered)" → patch sts command-args, not just in-memory CONFIG.
-- `AGENT_DIFFICULTY_BANK_v2.md` Pattern 1 (Layered Self-Healing, 40-60%
-  variance), Anti-pattern #35 (test-variant saturation — what a2 was),
-  Anti-pattern #23 (mechanism diversity across axes).
-- `task-authoring-playbook.md` #16 (hint calibration, U-curve), #29
-  (audit all checks after one bug), #30 (HANDOFF.md).
-- `Master guide.md` strict-ceiling rules, §V39 sidecar camouflage.
+- `task-hardner.md` — Hardening Decision Tree, U-curve calibration
+- `AGENT_DIFFICULTY_BANK_v2.md` — Pattern 1 (layered self-healing),
+  Anti-pattern #23 (same-shape mechanism diversity), Anti-pattern #27
+  (atoms that the model has reliably internalized)
+- `task-authoring-playbook.md` — Multiplication Trick math table,
+  Hint Disclosure U-curve specifics
+- `Master guide.md` — strict-ceiling rules, AND-gate non-functional rule
+- `nebula-task-reviewer-v3.md` — 7-phase review procedure
+- `nebula-batch-qc-feedback.md` — 20-point QC reformat
