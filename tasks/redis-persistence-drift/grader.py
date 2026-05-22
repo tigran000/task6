@@ -16,14 +16,16 @@ between-subscore checks are independent code paths.
          AND reverters planted on the Redis sts itself.
       a2 argocd_application_synced  (CLUSTER-STATE AUDIT)
          The bleater-platform ArgoCD Application must have
-         spec.syncPolicy.automated set AND status.sync.status == 'Synced'.
-         Setup.sh strips automated sync; a correct cleanup restores
-         GitOps reconciliation so the next drift event auto-reconciles.
-         Same theme as a1 ("nothing will undo persistence again"),
-         different mechanism (reconciliation loop ownership vs reverter
-         workloads).
+         spec.syncPolicy.automated.selfHeal == true AND .prune == true
+         AND status.sync.status == 'Synced'. selfHeal and prune are
+         semantically distinct: selfHeal reverts modifications, prune
+         removes orphaned out-of-band resources. Agents who set only
+         selfHeal leave the planted reverter CronJobs/Deployments
+         unowned by the Application — they linger across the next
+         reconcile. Setup.sh strips automated sync entirely; a correct
+         cleanup restores both flags.
 
-  B alert_observability     (weight 1/2) — AND-gate of 5 atoms.
+  B alert_observability     (weight 1/2) — AND-gate of 3 atoms.
       b1 alert_rule_loaded
          Three-store rule discovery (Prometheus /api/v1/rules, Grafana
          file-provisioning CM, Grafana runtime API). Reports the matched
@@ -44,13 +46,6 @@ between-subscore checks are independent code paths.
          inside the Grafana pod). The matched receiver must not be in
          the blackhole set. Prometheus-store rules fail-open (this
          snapshot has no Alertmanager wired).
-      b4 alert_has_for_duration
-         The matched rule has a non-zero `for:` pending window so it
-         does not page on every transient flip. SRE quality gate.
-      b5 alert_has_severity_label
-         The matched rule has a severity label set to a recognized
-         routing value (critical/high/page/error/warning). Required
-         for the notification policy tree to route by severity.
 
 A and B are fully independent. A is measured against the cluster state
 the agent left behind. Before B starts measuring, the grader takes
@@ -293,43 +288,52 @@ _ARGOCD_APP = "bleater-platform"
 
 def _a2_argocd_reconciled():
     """Verify the bleater-platform ArgoCD Application is back in a healthy
-    self-reconciling state. Two binary conditions both required:
-      1. spec.syncPolicy.automated is non-empty (selfHeal + prune restored).
-      2. status.sync.status == 'Synced' (deployed state matches manifests).
-    setup.sh strips syncPolicy.automated so its breakage cannot be
-    auto-reverted by ArgoCD; a correct cleanup restores GitOps as the
-    source of truth so the next drift event reconciles automatically.
-    The v42 behavioral drift-injection variant was dropped: it caught
-    zero agents in 5 rollouts (5/5 passed), confirming the behavioral
-    step is downstream of the same precondition as the spec check and
-    adds wall-clock cost without variance.
+    self-reconciling state. Three binary conditions all required:
+      1. spec.syncPolicy.automated.selfHeal == true (mods get reverted).
+      2. spec.syncPolicy.automated.prune == true (orphans get removed).
+      3. status.sync.status == 'Synced' (deployed state matches manifests).
+    selfHeal and prune are semantically distinct — agents commonly set
+    selfHeal but forget prune, leaving orphaned reverter workloads
+    around even though the sts itself reconciles. The v42 behavioral
+    drift-injection variant was dropped: it caught zero agents in 5
+    rollouts (5/5 passed), confirming the behavioral step is downstream
+    of the same precondition as the spec check.
     Returns (ok, detail)."""
     rc_a, auto, _ = run(
         ["kubectl", "-n", _ARGOCD_NS, "get", "application", _ARGOCD_APP,
-         "-o", "jsonpath={.spec.syncPolicy.automated}"],
+         "-o", "json"],
         timeout=15,
     )
-    rc_s, sync, _ = run(
-        ["kubectl", "-n", _ARGOCD_NS, "get", "application", _ARGOCD_APP,
-         "-o", "jsonpath={.status.sync.status}"],
-        timeout=15,
-    )
-    if rc_a != 0 or rc_s != 0:
+    if rc_a != 0:
         return False, ("could not read ArgoCD Application %s/%s "
-                       "(rc_auto=%s rc_sync=%s)" %
-                       (_ARGOCD_NS, _ARGOCD_APP, rc_a, rc_s))
-    auto = (auto or "").strip()
-    sync = (sync or "").strip()
-    if not auto or auto in ("{}", "null"):
-        return False, ("ArgoCD %s spec.syncPolicy.automated is empty — "
-                       "selfHeal/prune not restored, so future GitOps "
-                       "drift will not auto-reconcile" % _ARGOCD_APP)
+                       "(rc=%s)" % (_ARGOCD_NS, _ARGOCD_APP, rc_a))
+    try:
+        app = json.loads(auto)
+    except Exception:
+        return False, "ArgoCD Application JSON unparseable"
+    automated = ((app.get("spec") or {})
+                 .get("syncPolicy") or {}).get("automated") or {}
+    self_heal = bool(automated.get("selfHeal"))
+    prune = bool(automated.get("prune"))
+    sync = (((app.get("status") or {}).get("sync") or {})
+            .get("status") or "").strip()
+    if not self_heal:
+        return False, ("ArgoCD %s spec.syncPolicy.automated.selfHeal is not "
+                       "true — modifications will not auto-revert, so a "
+                       "future Helm-upgrade-style drift will not be "
+                       "corrected" % _ARGOCD_APP)
+    if not prune:
+        return False, ("ArgoCD %s spec.syncPolicy.automated.prune is not "
+                       "true — orphaned out-of-band resources (like the "
+                       "planted reverter CronJobs/Deployments) will not "
+                       "be auto-removed on the next reconcile" %
+                       _ARGOCD_APP)
     if sync != "Synced":
         return False, ("ArgoCD %s status.sync.status=%r (expected 'Synced') "
                        "— live cluster diverges from GitOps manifests" %
                        (_ARGOCD_APP, sync))
-    return True, ("ArgoCD %s is Synced with automated syncPolicy restored "
-                  "(auto=%s)" % (_ARGOCD_APP, auto))
+    return True, ("ArgoCD %s is Synced with selfHeal=true AND prune=true" %
+                  _ARGOCD_APP)
 
 
 def _prom_query(path, timeout=15):
@@ -733,84 +737,6 @@ def _resolve_route_receiver(policy_root, labels):
             break
     receiver = current.get("receiver") or ""
     return str(receiver).strip().casefold()
-
-
-def _parse_duration_string(s):
-    """Parse a Grafana/Prometheus duration string ("5m", "30s", "1h30m",
-    or a bare numeric in seconds). Returns float seconds, or None."""
-    s = (s or "").strip().lower()
-    if not s:
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    total = 0.0
-    matches = re.findall(r"(\d+(?:\.\d+)?)([hms])", s)
-    if not matches:
-        return None
-    for n, u in matches:
-        n = float(n)
-        if u == "h":
-            total += n * 3600
-        elif u == "m":
-            total += n * 60
-        elif u == "s":
-            total += n
-    return total if total > 0 else None
-
-
-def _rule_for_duration_seconds(rule, source):
-    """Return the rule's `for` pending-window duration in seconds, or
-    None if not set. Prometheus rules expose `duration` (float seconds);
-    Grafana file/API rules expose `for` (string)."""
-    if source == "prometheus":
-        d = rule.get("duration")
-        try:
-            v = float(d) if d is not None else None
-        except (TypeError, ValueError):
-            return None
-        return v if v and v > 0 else None
-    return _parse_duration_string(rule.get("for") or "")
-
-
-# Accepted severity values for a "Redis persistence regressed" alert.
-# These are the labels on-call routing trees segment by; agents who omit
-# `severity` or use an unrecognized value (e.g. `info`, `low`) fail b5
-# because the policy tree has no rule to match them.
-_ACCEPTED_SEVERITY_VALUES = {"critical", "high", "page", "error", "warning"}
-
-
-def _b4_alert_has_for_duration(rule, source):
-    """Verify the matched rule has a non-zero `for:` pending window so it
-    does not page on every transient flip. Standard SRE practice; named
-    in the prompt's "make sure on-call gets notified" framing only via
-    the implicit anti-flap requirement."""
-    if rule is None:
-        return False, "no rule to test (b1 failed)"
-    sec = _rule_for_duration_seconds(rule, source)
-    if sec is None or sec <= 0:
-        return False, ("rule has no `for:` pending window — would page on "
-                       "every transient flip rather than sustained failure")
-    return True, ("rule has for=%gs (sustained-failure gate present)" % sec)
-
-
-def _b5_alert_has_severity_label(rule, source):
-    """Verify the matched rule has a severity label set to a recognized
-    on-call-routing value. Agents who omit `severity` or use an
-    unrecognized value cannot be routed by severity in the policy tree."""
-    if rule is None:
-        return False, "no rule to test (b1 failed)"
-    labels = {k.lower(): str(v).lower()
-              for k, v in (rule.get("labels") or {}).items()}
-    sev = labels.get("severity")
-    if not sev:
-        return False, ("rule has no severity label — cannot be segmented by "
-                       "severity in the notification policy tree")
-    if sev not in _ACCEPTED_SEVERITY_VALUES:
-        return False, ("rule severity=%r is not in accepted set %s" %
-                       (sev, sorted(_ACCEPTED_SEVERITY_VALUES)))
-    return True, "rule severity=%r (accepted)" % sev
 
 
 def _b3_route_is_pageable(rule, source):
@@ -1230,7 +1156,7 @@ def _b2_grafana_path(rule, pod):
 
 
 def subscore_b_alert_observability():
-    """AND-gate of 5 atoms, isolated from A so subscore independence holds.
+    """AND-gate of 3 atoms, isolated from A so subscore independence holds.
     Path-store-agnostic: accepts rules from Prometheus rule_files, Grafana
     file-provisioning ConfigMap, or Grafana runtime API.
       b1 alert_rule_loaded                      — three-store rule discovery.
@@ -1244,15 +1170,12 @@ def subscore_b_alert_observability():
                                                   non-blackhole receiver.
                                                   Prometheus-store rules fail
                                                   open (no Alertmanager).
-      b4 alert_has_for_duration                 — rule has a non-zero `for:`
-                                                  pending window so it does
-                                                  not page on every transient
-                                                  flip. Standard SRE practice.
-      b5 alert_has_severity_label               — rule has a severity label
-                                                  set to a recognized routing
-                                                  value (critical, high,
-                                                  page, error, warning).
-    b2/b3/b4/b5 all cascade to "no rule to test" when b1 fails.
+    b2/b3 cascade to "no rule to test" when b1 fails.
+
+    v43 added b4 (for-duration) and b5 (severity-label) as quality gates,
+    but historical config-presence atoms in this task have all saturated
+    to 5/5 within 1-2 versions. Dropped to keep B's variance signal on
+    its behavioral atom (b2) rather than diluting with structural checks.
     """
     rule, metric, source, err = _find_matching_alert_rule()
     b1_ok = rule is not None
@@ -1266,16 +1189,12 @@ def subscore_b_alert_observability():
     else:
         b1_detail = err or "no rule"
 
-    # b3 / b4 / b5 are config-only — cheap, no cluster mutation, run
-    # outside the isolation harness. Cascade when b1 fails.
+    # b3 is config-only — cheap, no cluster mutation, runs outside the
+    # isolation harness. Cascades when b1 fails.
     if not b1_ok:
         b3_ok, b3_detail = False, "no rule to test (b1 failed)"
-        b4_ok, b4_detail = False, "no rule to test (b1 failed)"
-        b5_ok, b5_detail = False, "no rule to test (b1 failed)"
     else:
         b3_ok, b3_detail = _b3_route_is_pageable(rule, source)
-        b4_ok, b4_detail = _b4_alert_has_for_duration(rule, source)
-        b5_ok, b5_detail = _b5_alert_has_severity_label(rule, source)
 
     isolation_state = None
     try:
@@ -1295,12 +1214,10 @@ def subscore_b_alert_observability():
     finally:
         _restore_cluster_after_b2(isolation_state)
 
-    return [int(b1_ok), int(b2_ok), int(b3_ok), int(b4_ok), int(b5_ok)], [
+    return [int(b1_ok), int(b2_ok), int(b3_ok)], [
         ("alert_rule_loaded", b1_ok, b1_detail),
         ("alert_fires_on_synthetic_failure", b2_ok, b2_detail),
         ("alert_routes_to_pageable_receiver", b3_ok, b3_detail),
-        ("alert_has_for_duration", b4_ok, b4_detail),
-        ("alert_has_severity_label", b5_ok, b5_detail),
     ]
 
 
