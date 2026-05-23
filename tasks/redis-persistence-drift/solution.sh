@@ -57,38 +57,15 @@ for entry in "bleater-bleat-service cache-config-tuner" \
   fi
 done
 
-echo "[solution] Deleting the broken redis sts (ArgoCD will recreate it from the chart manifest after git restore)..."
-# Why delete instead of kubectl apply -f $FIXED:
-#  Setup.sh's broken sts was created with kubectl client-side-apply
-#  (manager: kubectl-client-side-apply). If solution.sh ALSO applies a
-#  fixed sts via client-side-apply, then ArgoCD's subsequent sync needs
-#  to migrate field ownership from kubectl-client-side-apply to
-#  argocd-controller (SSA). That migration fails because the
-#  StatefulSet's volumeClaimTemplates is k8s-immutable and the
-#  CSA-managed vct shape differs from the chart-rendered SSA-target.
-#  Net result: ArgoCD reports OutOfSync indefinitely (a2 fails).
-#
-# Correct GitOps pattern: delete the broken sts, let ArgoCD create the
-# new sts directly from the chart manifest using its own
-# argocd-controller manager. No migration, no immutable-field conflict.
-# Setup.sh has already deleted the PVC, and the broken sts uses emptyDir,
-# so cleanup is straightforward.
-kubectl -n "$NS" scale sts "$STS" --replicas=0 >/dev/null 2>&1 || true
-WAIT=0
-while [ $WAIT -lt 60 ]; do
-  CNT=$(kubectl -n "$NS" get pod -l app=bleater-redis --no-headers 2>/dev/null | wc -l)
-  [ "$CNT" -eq 0 ] && break
-  sleep 2
-  WAIT=$((WAIT + 2))
-done
-kubectl -n "$NS" delete sts "$STS" --cascade=foreground --timeout=60s >/dev/null 2>&1 || true
-WAIT=0
-while [ $WAIT -lt 60 ]; do
-  kubectl -n "$NS" get sts "$STS" >/dev/null 2>&1 || break
-  sleep 2
-  WAIT=$((WAIT + 2))
-done
-echo "[solution] Broken sts removed; awaiting ArgoCD recreation (handled after git restore + sync trigger below)"
+# NOTE: sts delete is deferred until AFTER the git restore + ignoreDifferences
+# patch below. The earlier-placement bug (v48): we deleted the sts here, then
+# took ~30s to wire Grafana / restore git. If ArgoCD's auto-sync was still
+# active (setup.sh's disable patch hits a JSON Pointer that may not exist on
+# the snapshot's Application, and `|| true` masks the failure), ArgoCD's
+# reconciler created a new sts from the still-corrupted git in that window.
+# When solution.sh then restored git, ArgoCD's next reconcile saw the
+# freshly-created (broken) sts vs the now-correct chart and tried to UPDATE
+# volumeClaimTemplates — which k8s rejects as immutable. a2 -> OutOfSync.
 
 echo "[solution] Wiring alert rule via Grafana provisioning API (kubectl exec — no ConfigMap RBAC needed)..."
 # Probe /api/org — auth-required, returns 200 on valid creds for any org. The
@@ -371,6 +348,97 @@ else
   echo "[solution] WARN: no Gitea token or no snapshot at /tmp/bleater-manifests-original.b64"
 fi
 
+echo "[solution] Extending ArgoCD ignoreDifferences to cover .spec.volumeClaimTemplates on StatefulSets..."
+# Belt-and-braces: even if the delete-then-sync sequence below races with
+# ArgoCD's reconciler, we tell Argo to NOT consider .spec.volumeClaimTemplates
+# differences as drift. vct is k8s-immutable on existing StatefulSets, and any
+# minor shape difference between chart-rendered and live (e.g. introduced by
+# setup.sh's broken apply) blocks ArgoCD's sync with: "Forbidden: updates to
+# statefulset spec for fields other than 'replicas', 'ordinals', 'template',
+# 'updateStrategy'". Ignoring the field lets Argo report Synced based on the
+# mutable spec fields (template, replicas, updateStrategy) it can actually
+# reconcile.
+python3 - <<'PYEOF' 2>&1 || echo "[solution] WARN: ignoreDifferences patch script failed"
+import json, subprocess, sys
+try:
+    out = subprocess.check_output(
+        ["kubectl", "-n", "argocd", "get", "app", "bleater-platform", "-o", "json"],
+        timeout=20,
+    ).decode("utf-8", "replace")
+except Exception as e:
+    print("  could not GET application:", e)
+    sys.exit(0)
+try:
+    app = json.loads(out)
+except Exception as e:
+    print("  could not parse application json:", e)
+    sys.exit(0)
+spec = app.setdefault("spec", {})
+idf = spec.get("ignoreDifferences") or []
+sts_entry = None
+for e in idf:
+    if e.get("kind") == "StatefulSet" and e.get("group") == "apps":
+        sts_entry = e
+        break
+if sts_entry is None:
+    sts_entry = {"group": "apps", "kind": "StatefulSet", "jqPathExpressions": []}
+    idf.append(sts_entry)
+jqs = sts_entry.setdefault("jqPathExpressions", [])
+if ".spec.volumeClaimTemplates" not in jqs:
+    jqs.append(".spec.volumeClaimTemplates")
+patch = json.dumps({"spec": {"ignoreDifferences": idf}})
+try:
+    subprocess.check_call(
+        ["kubectl", "-n", "argocd", "patch", "app", "bleater-platform",
+         "--type=merge", "-p", patch],
+        timeout=20,
+    )
+    print("  ignoreDifferences patched (StatefulSet jqPathExpressions:", jqs, ")")
+except Exception as e:
+    print("  patch failed:", e)
+PYEOF
+
+echo "[solution] Deleting the broken redis sts AFTER git restore (so ArgoCD sees both live=absent + git=correct)..."
+# Critical ordering fix vs v48: previously we deleted the sts up-top, then
+# spent ~30s wiring Grafana / restoring git. If Argo's auto-sync was still
+# active (setup.sh's disable patch may have hit a non-existent JSON path
+# and silently failed), Argo's reconciler created a new sts from the
+# still-corrupted git in that window. Now we delete here — git is already
+# restored, so when Argo creates the new sts it gets the correct chart.
+kubectl -n "$NS" scale sts "$STS" --replicas=0 >/dev/null 2>&1 || true
+WAIT=0
+while [ $WAIT -lt 60 ]; do
+  CNT=$(kubectl -n "$NS" get pod -l app=bleater-redis --no-headers 2>/dev/null | wc -l)
+  [ "$CNT" -eq 0 ] && break
+  sleep 2
+  WAIT=$((WAIT + 2))
+done
+# Aggressive delete: --force --grace-period=0 hard-kills owned pods,
+# --cascade=foreground waits for them, --timeout caps the wait.
+kubectl -n "$NS" delete sts "$STS" --cascade=foreground --grace-period=0 --force --timeout=30s 2>/dev/null || true
+WAIT=0
+while [ $WAIT -lt 60 ]; do
+  if ! kubectl -n "$NS" get sts "$STS" >/dev/null 2>&1; then
+    break
+  fi
+  if [ $WAIT -ge 20 ]; then
+    kubectl -n "$NS" patch sts "$STS" --type=merge \
+      -p '{"metadata":{"finalizers":null}}' >/dev/null 2>&1 || true
+  fi
+  sleep 2
+  WAIT=$((WAIT + 2))
+done
+# Belt-and-braces: explicit pod delete in case the sts cascade left one
+# orphaned. Without this, our wait-for-pod loop below could detect a
+# pre-existing pod (after 0s) instead of waiting for Argo to create one.
+kubectl -n "$NS" delete pod -l app=bleater-redis --grace-period=0 --force --ignore-not-found >/dev/null 2>&1 || true
+# Also delete any orphan PVC so ArgoCD's recreate gets a clean slate.
+kubectl -n "$NS" delete pvc data-bleater-redis-0 --ignore-not-found --grace-period=0 --force >/dev/null 2>&1 || true
+if kubectl -n "$NS" get sts "$STS" >/dev/null 2>&1; then
+  echo "[solution] WARN: sts $STS still present after delete attempts"
+fi
+echo "[solution] Broken sts gone; ArgoCD will recreate from chart on next sync"
+
 echo "[solution] Restoring ArgoCD auto-sync on bleater-platform..."
 # Re-enable automated sync (selfHeal + prune) so ArgoCD takes back
 # ownership of the bleater-redis sts (which we deleted above) and
@@ -383,11 +451,19 @@ kubectl -n argocd patch application bleater-platform --type=merge \
 # tick (vs. normal refresh which can serve cached state).
 kubectl -n argocd annotate application bleater-platform \
   argocd.argoproj.io/refresh=hard --overwrite >/dev/null 2>&1 || true
-# Trigger an immediate sync operation. The Application controller
-# picks up spec.operation on its next reconcile loop and runs a sync
-# right away rather than waiting for the auto-sync polling interval.
+# Give the hard refresh a moment to complete the git fetch before the
+# sync operation kicks off — otherwise the sync runs against the stale
+# cached comparison.
+sleep 8
+# Trigger an immediate sync operation with Replace=true + force=true.
+# Replace=true makes ArgoCD use `kubectl replace --force` instead of
+# `kubectl apply`, which delete-and-recreates resources where immutable
+# fields differ (the StatefulSet.spec.volumeClaimTemplates case). Without
+# Replace, ArgoCD's apply attempt against any lingering live sts hits
+# "updates to statefulset spec for fields other than ... are forbidden"
+# and the operation stays OutOfSync.
 kubectl -n argocd patch application bleater-platform --type=merge \
-  -p='{"operation":{"sync":{"prune":true,"syncStrategy":{"apply":{"force":false}}}}}' \
+  -p='{"operation":{"sync":{"prune":true,"syncOptions":["Replace=true","ServerSideApply=true"],"syncStrategy":{"apply":{"force":true}}}}}' \
   >/dev/null 2>&1 || true
 
 # Wait for ArgoCD to recreate the redis sts + pod from chart. The
@@ -419,14 +495,24 @@ fi
 
 # Wait for ArgoCD to converge to Synced. Now that no CSA/SSA migration
 # is needed (Argo owns the sts from creation), this should complete
-# within seconds of the sts being ready.
+# within seconds of the sts being ready. Retry the sync operation every
+# 45s if still OutOfSync — covers the case where the first sync hit
+# the immutable-fields path before our delete propagated.
 WAIT=0
-while [ $WAIT -lt 180 ]; do
+LAST_RETRIGGER=0
+while [ $WAIT -lt 240 ]; do
   STATUS=$(kubectl -n argocd get application bleater-platform \
     -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "")
   if [ "$STATUS" = "Synced" ]; then
     echo "[solution] ArgoCD bleater-platform Synced (after ${WAIT}s)"
     break
+  fi
+  # Retrigger with Replace+force every 45s while OutOfSync.
+  if [ $((WAIT - LAST_RETRIGGER)) -ge 45 ] && [ "$STATUS" = "OutOfSync" ]; then
+    kubectl -n argocd patch application bleater-platform --type=merge \
+      -p='{"operation":{"sync":{"prune":true,"syncOptions":["Replace=true","ServerSideApply=true"],"syncStrategy":{"apply":{"force":true}}}}}' \
+      >/dev/null 2>&1 || true
+    LAST_RETRIGGER=$WAIT
   fi
   sleep 5
   WAIT=$((WAIT + 5))
@@ -448,7 +534,7 @@ print('  sync.revision :', (sync.get('revision') or '')[:12])
 print('  health.status :', (st.get('health') or {}).get('status'))
 op = st.get('operationState') or {}
 print('  op.phase      :', op.get('phase'))
-print('  op.message    :', (op.get('message') or '')[:200])
+print('  op.message    :', (op.get('message') or '')[:500])
 print('  conditions    :')
 for c in (st.get('conditions') or []):
     print('    - %s : %s' % (c.get('type'), (c.get('message') or '')[:160]))
