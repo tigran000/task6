@@ -439,14 +439,69 @@ if kubectl -n "$NS" get sts "$STS" >/dev/null 2>&1; then
 fi
 echo "[solution] Broken sts gone; ArgoCD will recreate from chart on next sync"
 
-echo "[solution] Restoring ArgoCD auto-sync on bleater-platform..."
-# Re-enable automated sync (selfHeal + prune) so ArgoCD takes back
-# ownership of the bleater-redis sts (which we deleted above) and
-# creates it from the now-restored chart manifest using its own
-# argocd-controller manager.
+echo "[solution] Restoring ArgoCD auto-sync + persistent Replace=true syncOption on bleater-platform..."
+# Two patches, separately, to avoid clobbering the existing syncOptions
+# array with a merge patch on the parent:
+#  1) Set spec.syncPolicy.automated (re-enable auto-sync).
+#  2) Append "Replace=true" to spec.syncPolicy.syncOptions if absent.
+#
+# Why Replace=true at the spec.syncPolicy level (not operation level): the
+# v49+v50 attempts set Replace=true in operation.sync.syncOptions but
+# ArgoCD's controller does NOT reliably honor operation-level syncOptions
+# across retries (v50 diagnostic confirmed: "Retrying attempt #5" still
+# hit the immutable-field error). Replace=true at spec.syncPolicy makes
+# ArgoCD use `kubectl replace --force` (delete + recreate) for ALL syncs
+# including retries -- this is the only way to apply a sts whose
+# volumeClaimTemplates differs from live, because vct is k8s-immutable
+# on existing StatefulSets.
+#
+# Also: ignoreDifferences (set earlier) only affects diff VISIBILITY in
+# status -- it does NOT prevent ArgoCD from applying those fields. So
+# Replace=true is the actual mechanism that resolves the immutable-vct
+# update path.
+
+# Step 1: re-enable automated sync (merge patch on automated only)
 kubectl -n argocd patch application bleater-platform --type=merge \
   -p='{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}' \
   >/dev/null 2>&1 || true
+
+# Step 2: ensure Replace=true is in spec.syncPolicy.syncOptions (idempotent)
+python3 - <<'PYEOF' 2>&1 || echo "[solution] WARN: Replace=true syncOption patch failed"
+import json, subprocess, sys
+try:
+    out = subprocess.check_output(
+        ["kubectl", "-n", "argocd", "get", "app", "bleater-platform", "-o", "json"],
+        timeout=20,
+    ).decode("utf-8", "replace")
+    app = json.loads(out)
+except Exception as e:
+    print("  could not GET application:", e)
+    sys.exit(0)
+sp = app.setdefault("spec", {}).setdefault("syncPolicy", {})
+opts = sp.get("syncOptions") or []
+changed = False
+if "Replace=true" not in opts:
+    opts.append("Replace=true")
+    changed = True
+if "ServerSideApply=true" not in opts:
+    opts.append("ServerSideApply=true")
+    changed = True
+sp["syncOptions"] = opts
+if changed:
+    patch = json.dumps({"spec": {"syncPolicy": {"syncOptions": opts}}})
+    try:
+        subprocess.check_call(
+            ["kubectl", "-n", "argocd", "patch", "app", "bleater-platform",
+             "--type=merge", "-p", patch],
+            timeout=20,
+        )
+        print("  syncOptions patched ->", opts)
+    except Exception as e:
+        print("  patch failed:", e)
+else:
+    print("  syncOptions already correct:", opts)
+PYEOF
+
 # Hard refresh forces ArgoCD to re-fetch from git on the next loop
 # tick (vs. normal refresh which can serve cached state).
 kubectl -n argocd annotate application bleater-platform \
@@ -455,15 +510,12 @@ kubectl -n argocd annotate application bleater-platform \
 # sync operation kicks off — otherwise the sync runs against the stale
 # cached comparison.
 sleep 8
-# Trigger an immediate sync operation with Replace=true + force=true.
-# Replace=true makes ArgoCD use `kubectl replace --force` instead of
-# `kubectl apply`, which delete-and-recreates resources where immutable
-# fields differ (the StatefulSet.spec.volumeClaimTemplates case). Without
-# Replace, ArgoCD's apply attempt against any lingering live sts hits
-# "updates to statefulset spec for fields other than ... are forbidden"
-# and the operation stays OutOfSync.
+# Trigger an immediate sync. With Replace=true now persistent in
+# spec.syncPolicy.syncOptions, this sync (and all retries) will use
+# kubectl replace --force semantics, bypassing the StatefulSet vct
+# immutability error.
 kubectl -n argocd patch application bleater-platform --type=merge \
-  -p='{"operation":{"sync":{"prune":true,"syncOptions":["Replace=true","ServerSideApply=true"],"syncStrategy":{"apply":{"force":true}}}}}' \
+  -p='{"operation":{"sync":{"prune":true,"syncStrategy":{"apply":{"force":true}}}}}' \
   >/dev/null 2>&1 || true
 
 # Wait for ArgoCD to recreate the redis sts + pod from chart. The

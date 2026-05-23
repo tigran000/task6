@@ -1,6 +1,6 @@
 # HANDOFF — redis-persistence-drift
 
-**Last updated:** 2026-05-24 (post-v50 push, full v48/v49 OutOfSync triage)
+**Last updated:** 2026-05-24 (post-v51 push, Replace=true at syncPolicy level)
 
 ## TL;DR
 
@@ -20,7 +20,7 @@ would regress the cluster on the next reconcile. Projected mean
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** v50 (pushed 2026-05-24, restructure: git restore → ignoreDifferences patch → sts delete → Argo sync)
+- **Current version:** v51 (pushed 2026-05-24, Replace=true syncOption persistent at spec.syncPolicy)
 - **VM:** `tigranharutyunyan59@34.186.153.63`, files at `~/task/`
 - **Local repo:** `/Users/tigran/task6`, GitHub `tigran000/task6`, master branch
 - **Runtime:** biggie-max-nebula, strict `0 < X < 0.50` ceiling
@@ -77,7 +77,8 @@ would regress the cluster on the next reconcile. Projected mean
 | v47 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | a2 still OutOfSync. Diagnostic revealed REAL root cause: CSA→SSA migration fails on immutable vct. v44 only "passed" a2 via stale status (no sync was triggered) |
 | v48 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | a2 still OutOfSync. Diagnostic revealed: ArgoCD created sts from corrupted git in 30s window before our restore; then update path hit immutable vct |
 | v49 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | Aggressive delete + Replace=true + force=true + retrigger loop. Same OutOfSync — race persists; sts delete still happens before git restore |
-| v50 | a1+a2+a3_source_repo | b1+b2+b3 | pending | Full restructure: 1) git restore FIRST 2) extend ignoreDifferences for vct 3) THEN delete broken sts 4) re-enable Argo. Multi-layered defense against the race |
+| v50 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | a2 still OutOfSync. Full diagnostic showed: "Retrying attempt #5" of vct immutable update. ignoreDifferences only affects diff visibility, not apply behavior |
+| v51 | a1+a2+a3_source_repo | b1+b2+b3 | pending | Add Replace=true to spec.syncPolicy.syncOptions (persistent, not per-operation). Replace=true makes Argo use `kubectl replace --force` = delete+recreate, bypassing vct immutability |
 
 ## v44 per-item (most recent batched data)
 
