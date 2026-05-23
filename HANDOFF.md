@@ -1,6 +1,6 @@
 # HANDOFF — redis-persistence-drift
 
-**Last updated:** 2026-05-24 (post-v51 push, Replace=true at syncPolicy level)
+**Last updated:** 2026-05-24 (post-v52 push, setup.sh hardening)
 
 ## TL;DR
 
@@ -20,7 +20,7 @@ would regress the cluster on the next reconcile. Projected mean
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** v51 (pushed 2026-05-24, Replace=true syncOption persistent at spec.syncPolicy)
+- **Current version:** v52 (pushed 2026-05-24, setup.sh hardening: reliable Argo disable + aggressive sts delete + create-or-replace)
 - **VM:** `tigranharutyunyan59@34.186.153.63`, files at `~/task/`
 - **Local repo:** `/Users/tigran/task6`, GitHub `tigran000/task6`, master branch
 - **Runtime:** biggie-max-nebula, strict `0 < X < 0.50` ceiling
@@ -78,7 +78,8 @@ would regress the cluster on the next reconcile. Projected mean
 | v48 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | a2 still OutOfSync. Diagnostic revealed: ArgoCD created sts from corrupted git in 30s window before our restore; then update path hit immutable vct |
 | v49 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | Aggressive delete + Replace=true + force=true + retrigger loop. Same OutOfSync — race persists; sts delete still happens before git restore |
 | v50 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | a2 still OutOfSync. Full diagnostic showed: "Retrying attempt #5" of vct immutable update. ignoreDifferences only affects diff visibility, not apply behavior |
-| v51 | a1+a2+a3_source_repo | b1+b2+b3 | pending | Add Replace=true to spec.syncPolicy.syncOptions (persistent, not per-operation). Replace=true makes Argo use `kubectl replace --force` = delete+recreate, bypassing vct immutability |
+| v51 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | No-Op validation failed at SETUP. Setup.sh's `op:remove /spec/syncPolicy/automated` silently failed when path absent; Argo auto-sync stayed on; Argo recreated sts during setup's delete-then-apply window |
+| v52 | a1+a2+a3_source_repo | b1+b2+b3 | pending | Setup.sh hardening: merge-patch-null for Argo disable (robust to path absent/present) + verify-then-fail-loud + aggressive sts delete + verify-absent + `kubectl create` with `replace --force` fallback |
 
 ## v44 per-item (most recent batched data)
 

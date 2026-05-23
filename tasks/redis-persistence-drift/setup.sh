@@ -53,9 +53,29 @@ while [ $WAIT -lt 300 ]; do
 done
 
 echo "[setup] Disabling bleater-platform ArgoCD auto-sync so the breakage sticks..."
-# Without this, ArgoCD's selfHeal will revert our sts patch within ~3 minutes.
-kubectl -n argocd patch application bleater-platform --type=json \
-  -p='[{"op":"remove","path":"/spec/syncPolicy/automated"}]' >/dev/null 2>&1 || true
+# Use JSON Merge Patch (RFC 7396) with explicit null to delete the field
+# whether or not it exists. The prior op:remove approach failed silently
+# when the path was already absent in the snapshot, leaving auto-sync
+# enabled and racing the sts delete-then-apply below (Argo would
+# recreate the sts from the chart between our delete and apply, and
+# kubectl apply would then fail with the immutable-vct error because
+# Argo's recreated sts has vct=[{data}] while BROKEN_STS_YAML has vct=[]).
+kubectl -n argocd patch application bleater-platform --type=merge \
+  -p='{"spec":{"syncPolicy":{"automated":null}}}' >/dev/null 2>&1 || true
+# Verify the disable actually took effect; if not, fall back to JSON Patch
+# op:replace which works regardless of prior state.
+AUTO_CHECK=$(kubectl -n argocd get app bleater-platform -o jsonpath='{.spec.syncPolicy.automated}' 2>/dev/null || echo "")
+if [ -n "$AUTO_CHECK" ]; then
+  echo "[setup] WARN: merge-null didn't clear automated ('${AUTO_CHECK}'); retrying with op:remove"
+  kubectl -n argocd patch application bleater-platform --type=json \
+    -p='[{"op":"remove","path":"/spec/syncPolicy/automated"}]' >/dev/null 2>&1 || true
+  AUTO_CHECK=$(kubectl -n argocd get app bleater-platform -o jsonpath='{.spec.syncPolicy.automated}' 2>/dev/null || echo "")
+  if [ -n "$AUTO_CHECK" ]; then
+    echo "ERROR: could not disable ArgoCD auto-sync (still='${AUTO_CHECK}'); setup would race Argo's reconciler"
+    exit 1
+  fi
+fi
+echo "[setup] ArgoCD auto-sync verified disabled (spec.syncPolicy.automated absent)"
 # Also strip the resource-level tracking annotation as belt-and-braces.
 kubectl -n "$NS" annotate sts "$STS" argocd.argoproj.io/tracking-id- >/dev/null 2>&1 || true
 
@@ -103,14 +123,45 @@ kubectl -n "$NS" delete pvc "$PVC" --ignore-not-found --timeout=30s >/dev/null 2
 kubectl -n "$NS" patch pvc "$PVC" -p '{"metadata":{"finalizers":null}}' --type=merge >/dev/null 2>&1 || true
 
 echo "[setup] Replacing StatefulSet (volumeClaimTemplates is immutable on update)..."
-kubectl -n "$NS" delete sts "$STS" --cascade=foreground --timeout=60s >/dev/null 2>&1 || true
+# Aggressive delete: --force --grace-period=0 hard-kills the sts and its
+# pods, --cascade=foreground waits for them. The wait loop below strips
+# finalizers if delete still hangs after 20s.
+kubectl -n "$NS" delete sts "$STS" --cascade=foreground --grace-period=0 --force --timeout=60s 2>/dev/null || true
 WAIT=0
-while [ $WAIT -lt 60 ]; do
-  kubectl -n "$NS" get sts "$STS" >/dev/null 2>&1 || break
+while [ $WAIT -lt 90 ]; do
+  if ! kubectl -n "$NS" get sts "$STS" >/dev/null 2>&1; then
+    break
+  fi
+  if [ $WAIT -ge 20 ]; then
+    kubectl -n "$NS" patch sts "$STS" --type=merge \
+      -p '{"metadata":{"finalizers":null}}' >/dev/null 2>&1 || true
+  fi
   sleep 2
   WAIT=$((WAIT + 2))
 done
-kubectl apply -f "$BROKEN_STS_YAML" >/dev/null
+# Belt-and-braces: explicit pod delete in case the sts cascade left orphans.
+kubectl -n "$NS" delete pod -l app=bleater-redis --grace-period=0 --force --ignore-not-found >/dev/null 2>&1 || true
+
+# Verify sts is truly absent before recreate. If still present, the
+# subsequent apply will hit the immutable-vct error.
+if kubectl -n "$NS" get sts "$STS" >/dev/null 2>&1; then
+  echo "ERROR: sts $STS still present after delete attempts; cannot proceed"
+  kubectl -n "$NS" get sts "$STS" -o yaml | head -40
+  exit 1
+fi
+
+# Use kubectl create so this is treated as a fresh resource (no apply
+# annotation lookup, no patch attempt). If create races with something
+# that recreated the sts (e.g., Argo despite the disable), fall back to
+# `replace --force` which does delete+create in one operation.
+if ! kubectl create -f "$BROKEN_STS_YAML" >/dev/null 2>&1; then
+  echo "[setup] WARN: create failed (likely race), trying replace --force"
+  if ! kubectl replace --force -f "$BROKEN_STS_YAML" >/dev/null 2>&1; then
+    echo "ERROR: could not create OR replace the broken sts"
+    kubectl -n "$NS" get sts "$STS" -o yaml 2>&1 | head -40
+    exit 1
+  fi
+fi
 
 echo "[setup] Waiting for new pod to come up with broken config..."
 
