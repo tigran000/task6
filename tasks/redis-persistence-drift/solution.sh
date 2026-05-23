@@ -373,10 +373,12 @@ except Exception: pass
 fi
 
 echo "[solution] Fixing the bleater-redis manifest in bleater-manifests (source of truth)..."
-# The manifest in git was corrupted by setup.sh (--appendonly no, empty
-# volumeClaimTemplates). Until git is fixed, re-enabling ArgoCD selfHeal
-# will reconcile the cluster back to no-persistence. Restore the
-# manifest via Gitea contents API, then re-enable Argo.
+# Setup.sh corrupted templates/infrastructure.yaml via a python YAML
+# round-trip that touches EVERY doc in the file (not just bleater-redis
+# sts). Restoring byte-identically from setup.sh's pre-corruption
+# snapshot is the only safe restore — any re-emit-from-AST approach
+# risks introducing field-order/quoting drift on the other resources
+# in the file, which makes ArgoCD see drift and fails a2 (OutOfSync).
 SOLUTION_TOKEN_RESP=$(curl -s -u "${GITEA_USER}:${GITEA_PASS}" \
   --connect-timeout 5 --max-time 15 \
   -H "Content-Type: application/json" \
@@ -384,73 +386,25 @@ SOLUTION_TOKEN_RESP=$(curl -s -u "${GITEA_USER}:${GITEA_PASS}" \
   "${GITEA_URL}/api/v1/users/${GITEA_USER}/tokens" 2>/dev/null || true)
 SOLUTION_TOKEN=$(echo "$SOLUTION_TOKEN_RESP" | grep -o '"sha1":"[^"]*"' | head -n1 | cut -d'"' -f4)
 
-if [ -n "$SOLUTION_TOKEN" ]; then
-  MANIFEST_RESP=$(curl -s -H "Authorization: token ${SOLUTION_TOKEN}" \
+if [ -n "$SOLUTION_TOKEN" ] && [ -f /tmp/bleater-manifests-original.b64 ]; then
+  ORIGINAL_CONTENT_B64=$(cat /tmp/bleater-manifests-original.b64 | tr -d '\n')
+  # Get current sha (after setup.sh's corruption commit)
+  CURRENT_FILE_RESP=$(curl -s -H "Authorization: token ${SOLUTION_TOKEN}" \
     --connect-timeout 5 --max-time 15 \
     "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-manifests/contents/templates/infrastructure.yaml")
-  CURRENT_SHA=$(echo "$MANIFEST_RESP" | python3 -c "import json,sys;
+  CURRENT_SHA=$(echo "$CURRENT_FILE_RESP" | python3 -c "import json,sys;
 try:
     print(json.load(sys.stdin).get('sha',''))
 except Exception:
     pass" 2>/dev/null)
-  FIXED_CONTENT_B64=$(echo "$MANIFEST_RESP" | python3 -c "
-import json, sys, base64, yaml
-try:
-    resp = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
-content_b64 = resp.get('content', '')
-if not content_b64:
-    sys.exit(1)
-try:
-    text = base64.b64decode(content_b64).decode('utf-8', 'replace')
-except Exception:
-    sys.exit(1)
-docs = list(yaml.safe_load_all(text))
-mutated = False
-for d in docs:
-    if not isinstance(d, dict):
-        continue
-    if d.get('kind') == 'StatefulSet' and ((d.get('metadata') or {}).get('name') == 'bleater-redis'):
-        spec = d.setdefault('spec', {})
-        # vct shape MUST match the live sts spec that the kubectl
-        # apply block above writes — otherwise ArgoCD sees a diff
-        # between git (this manifest) and live (kubectl apply output)
-        # and a2 fails with status.sync.status=OutOfSync. Mirror
-        # apiVersion/kind/volumeMode exactly.
-        spec['volumeClaimTemplates'] = [{
-            'apiVersion': 'v1',
-            'kind': 'PersistentVolumeClaim',
-            'metadata': {'name': 'data'},
-            'spec': {
-                'accessModes': ['ReadWriteOnce'],
-                'resources': {'requests': {'storage': '2Gi'}},
-                'volumeMode': 'Filesystem',
-            },
-        }]
-        pod = spec.setdefault('template', {}).setdefault('spec', {})
-        pod['volumes'] = [v for v in (pod.get('volumes') or []) if v.get('name') != 'data']
-        for c in pod.get('containers', []) or []:
-            if c.get('name') == 'redis':
-                c['command'] = [
-                    'redis-server', '--save', '3600 1 300 100 60 10000',
-                    '--appendonly', 'yes', '--appendfsync', 'everysec',
-                    '--dir', '/data',
-                ]
-        mutated = True
-if not mutated:
-    sys.exit(1)
-out = yaml.safe_dump_all(docs, default_flow_style=False)
-print(base64.b64encode(out.encode('utf-8')).decode('ascii'))
-" 2>/dev/null | tr -d '\n')
 
-  if [ -n "$CURRENT_SHA" ] && [ -n "$FIXED_CONTENT_B64" ]; then
+  if [ -n "$CURRENT_SHA" ] && [ -n "$ORIGINAL_CONTENT_B64" ]; then
     PUT_PAYLOAD=$(python3 -c "
 import json
 print(json.dumps({
     'sha': '${CURRENT_SHA}',
-    'content': '${FIXED_CONTENT_B64}',
-    'message': 'fix(redis): restore --appendonly yes + PVC (data) to prevent cache loss on pod restart',
+    'content': '${ORIGINAL_CONTENT_B64}',
+    'message': 'revert: restore bleater-redis persistence (rollback platform-perf change)',
 }))
 ")
     PUT_HTTP=$(curl -s -o /tmp/solution-manifest-resp -w "%{http_code}" \
@@ -459,10 +413,12 @@ print(json.dumps({
       -H "Content-Type: application/json" \
       -d "$PUT_PAYLOAD" \
       "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-manifests/contents/templates/infrastructure.yaml")
-    echo "[solution] bleater-manifests bleater-redis sts restored (HTTP ${PUT_HTTP})"
+    echo "[solution] bleater-manifests restored byte-identical to original (HTTP ${PUT_HTTP})"
   else
-    echo "[solution] WARN: could not compute fixed manifest content (sha=${CURRENT_SHA:-empty})"
+    echo "[solution] WARN: missing sha or snapshot (sha='${CURRENT_SHA}', snapshot_bytes=${#ORIGINAL_CONTENT_B64})"
   fi
+else
+  echo "[solution] WARN: no Gitea token or no snapshot at /tmp/bleater-manifests-original.b64"
 fi
 
 echo "[solution] Restoring ArgoCD auto-sync on bleater-platform..."
@@ -498,9 +454,43 @@ while [ $WAIT -lt 180 ]; do
   WAIT=$((WAIT + 5))
 done
 if [ "$STATUS" != "Synced" ]; then
-  echo "[solution] WARN: ArgoCD bleater-platform still ${STATUS} after 180s"
-  kubectl -n argocd get application bleater-platform -o jsonpath='{.status.sync}' 2>&1 | head -c 500
-  echo ""
+  echo "[solution] === DIAGNOSTIC: ArgoCD app state ==="
+  kubectl -n argocd get application bleater-platform -o json 2>/dev/null > /tmp/sol-app-diag.json
+  python3 - <<'PYEOF' 2>&1 || true
+import json, sys
+try:
+    d = json.load(open('/tmp/sol-app-diag.json'))
+except Exception as e:
+    print('  could not parse app json:', e)
+    sys.exit(0)
+st = d.get('status') or {}
+sync = st.get('sync') or {}
+print('  sync.status   :', sync.get('status'))
+print('  sync.revision :', (sync.get('revision') or '')[:12])
+print('  health.status :', (st.get('health') or {}).get('status'))
+op = st.get('operationState') or {}
+print('  op.phase      :', op.get('phase'))
+print('  op.message    :', (op.get('message') or '')[:200])
+print('  conditions    :')
+for c in (st.get('conditions') or []):
+    print('    - %s : %s' % (c.get('type'), (c.get('message') or '')[:160]))
+print('  drifted resources (status != Synced):')
+any_drift = False
+for r in (st.get('resources') or []):
+    rs = r.get('status')
+    if rs and rs != 'Synced':
+        any_drift = True
+        h = (r.get('health') or {}).get('status') or '?'
+        print('    - %s/%s ns=%s status=%s health=%s' % (
+            r.get('kind'), r.get('name'), r.get('namespace'), rs, h))
+if not any_drift:
+    print('    (none reported)')
+spec_src = (d.get('spec') or {}).get('source') or {}
+print('  spec.source.targetRevision:', spec_src.get('targetRevision'))
+print('  comparedTo.source.targetRevision:',
+      ((sync.get('comparedTo') or {}).get('source') or {}).get('targetRevision'))
+PYEOF
+  echo "[solution] === END DIAGNOSTIC ==="
 fi
 
 echo "[solution] Done."

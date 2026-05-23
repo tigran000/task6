@@ -448,24 +448,45 @@ def _a3_source_repo_aligned():
     # ['--save', ''] and ['--appendonly', 'no'] / ['--appendonly', 'yes'].
     # Joining-and-regex misses the empty-string case because the quotes
     # are YAML-level (the parser strips them). Scan pairs instead.
+    #
+    # YAML 1.1 boolean coercion: an UNQUOTED `yes` in the source YAML
+    # parses to Python True, and `no` parses to False. The chart may
+    # write either quoted strings or unquoted booleans. Normalize:
+    # accept "yes"/"on"/"true"/True as enabled, "no"/"off"/"false"/False
+    # as disabled. Same for save="" (empty string vs Python None).
+    _ENABLED = {"yes", "on", "true"}
+    _DISABLED = {"no", "off", "false"}
     appendonly_value = None
+    appendonly_present = False
     save_value = None
+    save_present = False
     for i, arg in enumerate(cmd_args):
         token = str(arg).strip().lower()
         if token == "--appendonly" and i + 1 < len(cmd_args):
-            appendonly_value = str(cmd_args[i + 1]).strip().lower()
+            appendonly_present = True
+            raw = cmd_args[i + 1]
+            if isinstance(raw, bool):
+                appendonly_value = "yes" if raw else "no"
+            else:
+                appendonly_value = str(raw).strip().lower()
+                if appendonly_value in _ENABLED:
+                    appendonly_value = "yes"
+                elif appendonly_value in _DISABLED:
+                    appendonly_value = "no"
         elif token == "--save" and i + 1 < len(cmd_args):
-            save_value = str(cmd_args[i + 1]).strip()
+            save_present = True
+            raw = cmd_args[i + 1]
+            save_value = "" if raw is None else str(raw).strip()
     if appendonly_value == "no":
         return False, ("bleater-redis StatefulSet in git still has "
                        "--appendonly no — live cluster will regress "
                        "to no-AOF on next ArgoCD reconcile (command=%r)"
                        % cmd_args)
-    if save_value is not None and save_value in ("", '""', "''"):
+    if save_present and save_value in ("", '""', "''"):
         return False, ("bleater-redis StatefulSet in git still has "
                        "--save \"\" — RDB snapshots disabled at the "
                        "source (command=%r)" % cmd_args)
-    if appendonly_value != "yes":
+    if not appendonly_present or appendonly_value != "yes":
         return False, ("bleater-redis StatefulSet in git command does "
                        "not enable --appendonly yes (saw appendonly=%r, "
                        "command=%r)" % (appendonly_value, cmd_args))

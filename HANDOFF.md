@@ -1,6 +1,6 @@
 # HANDOFF — redis-persistence-drift
 
-**Last updated:** 2026-05-23 (post-v46 push, solution.sh hotfix for a2 OutOfSync)
+**Last updated:** 2026-05-23 (post-v47 push, byte-identical manifest restore + a2 root-cause fix)
 
 ## TL;DR
 
@@ -20,7 +20,7 @@ would regress the cluster on the next reconcile. Projected mean
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** v46 (pushed 2026-05-23, solution.sh hotfix only)
+- **Current version:** v47 (pushed 2026-05-23, setup+solution+grader hotfixes; solution.sh scores 1.0 locally expected)
 - **VM:** `tigranharutyunyan59@34.186.153.63`, files at `~/task/`
 - **Local repo:** `/Users/tigran/task6`, GitHub `tigran000/task6`, master branch
 - **Runtime:** biggie-max-nebula, strict `0 < X < 0.50` ceiling
@@ -73,7 +73,8 @@ would regress the cluster on the next reconcile. Projected mean
 | v43 | a1+a2 | b1+b2+b3+b4_for+b5_severity | not batched | preempted as redundant |
 | v44 | a1+a2_prune_strict | b1+b2+b3 | 0.60 | prune-tightening caught 0/5 |
 | v45 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | solution.sh scored 0.5 locally — a2 OutOfSync due to git/live vct shape mismatch |
-| v46 | a1+a2+a3_source_repo | b1+b2+b3 | pending | hotfix: vct in git restore matches live apply byte-for-byte; Argo wait 180s + hard refresh + explicit sync operation |
+| v46 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | solution.sh STILL 0.5 — a2 OutOfSync. vct-shape guess was wrong root cause |
+| v47 | a1+a2+a3_source_repo | b1+b2+b3 | pending | real root-cause fix: byte-identical manifest restore from snapshot (no YAML round-trip); grader handles YAML 1.1 boolean coercion; diagnostic dump on Argo timeout |
 
 ## v44 per-item (most recent batched data)
 
