@@ -1,6 +1,6 @@
 # HANDOFF — redis-persistence-drift
 
-**Last updated:** 2026-05-22 (post-v45 push, source_repo_aligned lever added)
+**Last updated:** 2026-05-23 (post-v46 push, solution.sh hotfix for a2 OutOfSync)
 
 ## TL;DR
 
@@ -20,7 +20,7 @@ would regress the cluster on the next reconcile. Projected mean
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** v45 (pushed 2026-05-22)
+- **Current version:** v46 (pushed 2026-05-23, solution.sh hotfix only)
 - **VM:** `tigranharutyunyan59@34.186.153.63`, files at `~/task/`
 - **Local repo:** `/Users/tigran/task6`, GitHub `tigran000/task6`, master branch
 - **Runtime:** biggie-max-nebula, strict `0 < X < 0.50` ceiling
@@ -72,7 +72,8 @@ would regress the cluster on the next reconcile. Projected mean
 | v42 | a1+a2_drift_behavioral | b1+b2+b3 | 0.60 | behavioral drift caught 0/5 |
 | v43 | a1+a2 | b1+b2+b3+b4_for+b5_severity | not batched | preempted as redundant |
 | v44 | a1+a2_prune_strict | b1+b2+b3 | 0.60 | prune-tightening caught 0/5 |
-| v45 | a1+a2+a3_source_repo | b1+b2+b3 | pending | source-of-truth lever (Option 1) |
+| v45 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | solution.sh scored 0.5 locally — a2 OutOfSync due to git/live vct shape mismatch |
+| v46 | a1+a2+a3_source_repo | b1+b2+b3 | pending | hotfix: vct in git restore matches live apply byte-for-byte; Argo wait 180s + hard refresh + explicit sync operation |
 
 ## v44 per-item (most recent batched data)
 

@@ -413,11 +413,19 @@ for d in docs:
         continue
     if d.get('kind') == 'StatefulSet' and ((d.get('metadata') or {}).get('name') == 'bleater-redis'):
         spec = d.setdefault('spec', {})
+        # vct shape MUST match the live sts spec that the kubectl
+        # apply block above writes — otherwise ArgoCD sees a diff
+        # between git (this manifest) and live (kubectl apply output)
+        # and a2 fails with status.sync.status=OutOfSync. Mirror
+        # apiVersion/kind/volumeMode exactly.
         spec['volumeClaimTemplates'] = [{
+            'apiVersion': 'v1',
+            'kind': 'PersistentVolumeClaim',
             'metadata': {'name': 'data'},
             'spec': {
                 'accessModes': ['ReadWriteOnce'],
                 'resources': {'requests': {'storage': '2Gi'}},
+                'volumeMode': 'Filesystem',
             },
         }]
         pod = spec.setdefault('template', {}).setdefault('spec', {})
@@ -464,20 +472,35 @@ echo "[solution] Restoring ArgoCD auto-sync on bleater-platform..."
 kubectl -n argocd patch application bleater-platform --type=merge \
   -p='{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}' \
   >/dev/null 2>&1 || true
-# Nudge a refresh so status.sync.status updates promptly.
+# Hard refresh forces ArgoCD to re-fetch from git on the next loop
+# tick (vs. normal refresh which can serve cached state).
 kubectl -n argocd annotate application bleater-platform \
-  argocd.argoproj.io/refresh=normal --overwrite >/dev/null 2>&1 || true
-# Wait briefly for ArgoCD to reconcile and report Synced.
+  argocd.argoproj.io/refresh=hard --overwrite >/dev/null 2>&1 || true
+# Trigger an immediate sync operation. The Application controller
+# picks up spec.operation on its next reconcile loop and runs a sync
+# right away rather than waiting for the auto-sync polling interval.
+kubectl -n argocd patch application bleater-platform --type=merge \
+  -p='{"operation":{"sync":{"prune":true,"syncStrategy":{"apply":{"force":false}}}}}' \
+  >/dev/null 2>&1 || true
+# Wait up to 180s for ArgoCD to converge to Synced. The default
+# refresh interval is 3 minutes, so even with hard-refresh annotation
+# the controller may take ~60-90s to actually pick up the change
+# under load. The previous 60s window was too short.
 WAIT=0
-while [ $WAIT -lt 60 ]; do
+while [ $WAIT -lt 180 ]; do
   STATUS=$(kubectl -n argocd get application bleater-platform \
     -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "")
   if [ "$STATUS" = "Synced" ]; then
-    echo "[solution] ArgoCD bleater-platform Synced"
+    echo "[solution] ArgoCD bleater-platform Synced (after ${WAIT}s)"
     break
   fi
-  sleep 3
-  WAIT=$((WAIT + 3))
+  sleep 5
+  WAIT=$((WAIT + 5))
 done
+if [ "$STATUS" != "Synced" ]; then
+  echo "[solution] WARN: ArgoCD bleater-platform still ${STATUS} after 180s"
+  kubectl -n argocd get application bleater-platform -o jsonpath='{.status.sync}' 2>&1 | head -c 500
+  echo ""
+fi
 
 echo "[solution] Done."
