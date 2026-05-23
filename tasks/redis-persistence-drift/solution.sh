@@ -57,52 +57,22 @@ for entry in "bleater-bleat-service cache-config-tuner" \
   fi
 done
 
-echo "[solution] Reading current redis StatefulSet..."
-ORIG=$(mktemp)
-kubectl -n "$NS" get sts "$STS" -o yaml > "$ORIG"
-
-echo "[solution] Building corrected sts spec (persistence on, PVC at /data)..."
-FIXED=$(mktemp)
-python3 - "$ORIG" "$FIXED" <<'PY'
-import sys, yaml
-src, dst = sys.argv[1], sys.argv[2]
-d = yaml.safe_load(open(src).read())
-md = d.get("metadata", {})
-for f in ("creationTimestamp", "resourceVersion", "uid", "generation", "managedFields"):
-    md.pop(f, None)
-d.pop("status", None)
-spec = d["spec"]
-# Restore volumeClaimTemplates for /data
-spec["volumeClaimTemplates"] = [{
-    "apiVersion": "v1",
-    "kind": "PersistentVolumeClaim",
-    "metadata": {"name": "data"},
-    "spec": {
-        "accessModes": ["ReadWriteOnce"],
-        "resources": {"requests": {"storage": "2Gi"}},
-        "volumeMode": "Filesystem",
-    },
-}]
-pod = spec["template"]["spec"]
-# Drop the broken emptyDir; let the PVC template provide the volume
-pod["volumes"] = [v for v in (pod.get("volumes") or []) if v.get("name") != "data"]
-# Keep only the canonical redis container — strip any reverter sidecars
-# planted on the sts (e.g., redis-metrics-exporter).
-pod["containers"] = [c for c in pod.get("containers", []) if c.get("name") == "redis"]
-# Restore the canonical command with persistence enabled
-for c in pod.get("containers", []):
-    if c.get("name") == "redis":
-        c["command"] = [
-            "redis-server",
-            "--save", "3600 1 300 100 60 10000",
-            "--appendonly", "yes",
-            "--appendfsync", "everysec",
-            "--dir", "/data",
-        ]
-open(dst, "w").write(yaml.safe_dump(d))
-PY
-
-echo "[solution] Scaling redis to 0 to release any storage lock (RWO PVC discipline)..."
+echo "[solution] Deleting the broken redis sts (ArgoCD will recreate it from the chart manifest after git restore)..."
+# Why delete instead of kubectl apply -f $FIXED:
+#  Setup.sh's broken sts was created with kubectl client-side-apply
+#  (manager: kubectl-client-side-apply). If solution.sh ALSO applies a
+#  fixed sts via client-side-apply, then ArgoCD's subsequent sync needs
+#  to migrate field ownership from kubectl-client-side-apply to
+#  argocd-controller (SSA). That migration fails because the
+#  StatefulSet's volumeClaimTemplates is k8s-immutable and the
+#  CSA-managed vct shape differs from the chart-rendered SSA-target.
+#  Net result: ArgoCD reports OutOfSync indefinitely (a2 fails).
+#
+# Correct GitOps pattern: delete the broken sts, let ArgoCD create the
+# new sts directly from the chart manifest using its own
+# argocd-controller manager. No migration, no immutable-field conflict.
+# Setup.sh has already deleted the PVC, and the broken sts uses emptyDir,
+# so cleanup is straightforward.
 kubectl -n "$NS" scale sts "$STS" --replicas=0 >/dev/null 2>&1 || true
 WAIT=0
 while [ $WAIT -lt 60 ]; do
@@ -111,8 +81,6 @@ while [ $WAIT -lt 60 ]; do
   sleep 2
   WAIT=$((WAIT + 2))
 done
-
-echo "[solution] Replacing the StatefulSet with persistence enabled (vct is immutable)..."
 kubectl -n "$NS" delete sts "$STS" --cascade=foreground --timeout=60s >/dev/null 2>&1 || true
 WAIT=0
 while [ $WAIT -lt 60 ]; do
@@ -120,25 +88,7 @@ while [ $WAIT -lt 60 ]; do
   sleep 2
   WAIT=$((WAIT + 2))
 done
-kubectl apply -f "$FIXED" >/dev/null
-
-echo "[solution] Waiting for redis pod to come up with the new spec..."
-WAIT=0
-while [ $WAIT -lt 180 ]; do
-  PHASE=$(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)
-  if [ "$PHASE" = "Running" ]; then
-    PONG=$(kubectl -n "$NS" exec "$POD" -- redis-cli PING 2>/dev/null || true)
-    [ "$PONG" = "PONG" ] && break
-  fi
-  sleep 3
-  WAIT=$((WAIT + 3))
-done
-
-# Belt-and-braces: also drive CONFIG SET in case the args didn't propagate.
-kubectl -n "$NS" exec "$POD" -- redis-cli CONFIG SET save "3600 1 300 100 60 10000" >/dev/null 2>&1 || true
-kubectl -n "$NS" exec "$POD" -- redis-cli CONFIG SET appendonly yes >/dev/null 2>&1 || true
-kubectl -n "$NS" exec "$POD" -- redis-cli CONFIG SET appendfsync everysec >/dev/null 2>&1 || true
-kubectl -n "$NS" exec "$POD" -- redis-cli BGSAVE >/dev/null 2>&1 || true
+echo "[solution] Broken sts removed; awaiting ArgoCD recreation (handled after git restore + sync trigger below)"
 
 echo "[solution] Wiring alert rule via Grafana provisioning API (kubectl exec — no ConfigMap RBAC needed)..."
 # Probe /api/org — auth-required, returns 200 on valid creds for any org. The
@@ -422,9 +372,10 @@ else
 fi
 
 echo "[solution] Restoring ArgoCD auto-sync on bleater-platform..."
-# Re-enable automated sync (selfHeal + prune) so future GitOps drift
-# auto-reconciles. Live cluster already matches manifests after our
-# manual fix, so ArgoCD should mark the app Synced on the next refresh.
+# Re-enable automated sync (selfHeal + prune) so ArgoCD takes back
+# ownership of the bleater-redis sts (which we deleted above) and
+# creates it from the now-restored chart manifest using its own
+# argocd-controller manager.
 kubectl -n argocd patch application bleater-platform --type=merge \
   -p='{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}' \
   >/dev/null 2>&1 || true
@@ -438,10 +389,37 @@ kubectl -n argocd annotate application bleater-platform \
 kubectl -n argocd patch application bleater-platform --type=merge \
   -p='{"operation":{"sync":{"prune":true,"syncStrategy":{"apply":{"force":false}}}}}' \
   >/dev/null 2>&1 || true
-# Wait up to 180s for ArgoCD to converge to Synced. The default
-# refresh interval is 3 minutes, so even with hard-refresh annotation
-# the controller may take ~60-90s to actually pick up the change
-# under load. The previous 60s window was too short.
+
+# Wait for ArgoCD to recreate the redis sts + pod from chart. The
+# sts is deleted above; Argo must create it via SSA. This is the
+# load-bearing step — grader's b2 needs a Running redis pod.
+echo "[solution] Waiting for ArgoCD to recreate bleater-redis sts + pod..."
+WAIT=0
+POD=""
+while [ $WAIT -lt 240 ]; do
+  POD=$(kubectl -n "$NS" get pod -l app=bleater-redis -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+  if [ -n "$POD" ]; then
+    PHASE=$(kubectl -n "$NS" get pod "$POD" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+    if [ "$PHASE" = "Running" ]; then
+      PONG=$(kubectl -n "$NS" exec "$POD" -- redis-cli PING 2>/dev/null || echo "")
+      if [ "$PONG" = "PONG" ]; then
+        echo "[solution] redis pod ${POD} Running and responsive (after ${WAIT}s)"
+        break
+      fi
+    fi
+  fi
+  sleep 5
+  WAIT=$((WAIT + 5))
+done
+if [ -z "$POD" ] || [ "$PHASE" != "Running" ]; then
+  echo "[solution] WARN: redis pod did not become ready in 240s (pod='${POD}', phase='${PHASE}')"
+  kubectl -n "$NS" get sts "$STS" 2>&1 | head -3
+  kubectl -n "$NS" get pod -l app=bleater-redis 2>&1 | head -5
+fi
+
+# Wait for ArgoCD to converge to Synced. Now that no CSA/SSA migration
+# is needed (Argo owns the sts from creation), this should complete
+# within seconds of the sts being ready.
 WAIT=0
 while [ $WAIT -lt 180 ]; do
   STATUS=$(kubectl -n argocd get application bleater-platform \

@@ -1,6 +1,6 @@
 # HANDOFF — redis-persistence-drift
 
-**Last updated:** 2026-05-23 (post-v47 push, byte-identical manifest restore + a2 root-cause fix)
+**Last updated:** 2026-05-23 (post-v48 push, sts ownership handed to ArgoCD)
 
 ## TL;DR
 
@@ -20,7 +20,7 @@ would regress the cluster on the next reconcile. Projected mean
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** v47 (pushed 2026-05-23, setup+solution+grader hotfixes; solution.sh scores 1.0 locally expected)
+- **Current version:** v48 (pushed 2026-05-23, solution.sh defers sts creation to ArgoCD)
 - **VM:** `tigranharutyunyan59@34.186.153.63`, files at `~/task/`
 - **Local repo:** `/Users/tigran/task6`, GitHub `tigran000/task6`, master branch
 - **Runtime:** biggie-max-nebula, strict `0 < X < 0.50` ceiling
@@ -74,7 +74,8 @@ would regress the cluster on the next reconcile. Projected mean
 | v44 | a1+a2_prune_strict | b1+b2+b3 | 0.60 | prune-tightening caught 0/5 |
 | v45 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | solution.sh scored 0.5 locally — a2 OutOfSync due to git/live vct shape mismatch |
 | v46 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | solution.sh STILL 0.5 — a2 OutOfSync. vct-shape guess was wrong root cause |
-| v47 | a1+a2+a3_source_repo | b1+b2+b3 | pending | real root-cause fix: byte-identical manifest restore from snapshot (no YAML round-trip); grader handles YAML 1.1 boolean coercion; diagnostic dump on Argo timeout |
+| v47 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | a2 still OutOfSync. Diagnostic revealed REAL root cause: CSA→SSA migration fails on immutable vct. v44 only "passed" a2 via stale status (no sync was triggered) |
+| v48 | a1+a2+a3_source_repo | b1+b2+b3 | pending | solution.sh deletes broken sts and lets ArgoCD recreate from chart (no CSA→SSA migration, no vct immutability conflict). Waits for redis pod Running + Argo Synced |
 
 ## v44 per-item (most recent batched data)
 
