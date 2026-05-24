@@ -1,6 +1,6 @@
 # HANDOFF — redis-persistence-drift
 
-**Last updated:** 2026-05-24 (post-v52 push, setup.sh hardening)
+**Last updated:** 2026-05-24 (post-v53 push, RespectIgnoreDifferences + pre-apply SSA)
 
 ## TL;DR
 
@@ -20,7 +20,7 @@ would regress the cluster on the next reconcile. Projected mean
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** v52 (pushed 2026-05-24, setup.sh hardening: reliable Argo disable + aggressive sts delete + create-or-replace)
+- **Current version:** v53 (pushed 2026-05-24, two independent vct-immutability fixes layered)
 - **VM:** `tigranharutyunyan59@34.186.153.63`, files at `~/task/`
 - **Local repo:** `/Users/tigran/task6`, GitHub `tigran000/task6`, master branch
 - **Runtime:** biggie-max-nebula, strict `0 < X < 0.50` ceiling
@@ -79,7 +79,8 @@ would regress the cluster on the next reconcile. Projected mean
 | v49 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | Aggressive delete + Replace=true + force=true + retrigger loop. Same OutOfSync — race persists; sts delete still happens before git restore |
 | v50 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | a2 still OutOfSync. Full diagnostic showed: "Retrying attempt #5" of vct immutable update. ignoreDifferences only affects diff visibility, not apply behavior |
 | v51 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | No-Op validation failed at SETUP. Setup.sh's `op:remove /spec/syncPolicy/automated` silently failed when path absent; Argo auto-sync stayed on; Argo recreated sts during setup's delete-then-apply window |
-| v52 | a1+a2+a3_source_repo | b1+b2+b3 | pending | Setup.sh hardening: merge-patch-null for Argo disable (robust to path absent/present) + verify-then-fail-loud + aggressive sts delete + verify-absent + `kubectl create` with `replace --force` fallback |
+| v52 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | Setup.sh now succeeds (hardening worked) but a2 OutOfSync persisted. Diagnostic confirmed `Replace=true` IS in effect ("error when replacing /dev/shm/...") but kubectl replace ≠ kubectl replace --force; immutable error continues |
+| v53 | a1+a2+a3_source_repo | b1+b2+b3 | pending | Two layered fixes: 1) add `RespectIgnoreDifferences=true` syncOption so vct gets excluded from apply payload (not just diff display) 2) pre-apply chart's sts via SSA with manager=argocd-controller + resource-level Force+Replace annotation before re-enabling Argo |
 
 ## v44 per-item (most recent batched data)
 

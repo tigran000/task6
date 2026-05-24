@@ -437,7 +437,72 @@ kubectl -n "$NS" delete pvc data-bleater-redis-0 --ignore-not-found --grace-peri
 if kubectl -n "$NS" get sts "$STS" >/dev/null 2>&1; then
   echo "[solution] WARN: sts $STS still present after delete attempts"
 fi
-echo "[solution] Broken sts gone; ArgoCD will recreate from chart on next sync"
+echo "[solution] Broken sts gone."
+
+# Pre-apply the chart's bleater-redis sts BEFORE re-enabling ArgoCD, so the
+# live state already matches what Argo's chart-rendering would produce. This
+# is the load-bearing fix: with live == chart-rendered, Argo's diff is
+# empty (modulo Helm-injected labels which are mutable and Argo can patch
+# without immutable errors). The CSA/SSA migration trap is avoided because
+# we apply with field-manager=argocd-controller — when Argo's sync runs,
+# it sees fields already owned by itself, no migration needed.
+echo "[solution] Pre-applying chart's bleater-redis sts via SSA (matches what ArgoCD will compute as desired)..."
+python3 - <<'PYEOF' > /tmp/redis-sts-from-chart.yaml 2>/tmp/redis-sts-extract.err
+import base64, yaml, sys
+try:
+    b64 = open('/tmp/bleater-manifests-original.b64').read().strip()
+    text = base64.b64decode(b64).decode('utf-8', 'replace')
+except Exception as e:
+    sys.stderr.write('snapshot read failed: %s\n' % e)
+    sys.exit(1)
+try:
+    docs = list(yaml.safe_load_all(text))
+except Exception as e:
+    sys.stderr.write('yaml parse failed: %s\n' % e)
+    sys.exit(1)
+for d in docs:
+    if not isinstance(d, dict):
+        continue
+    if (d.get('kind') == 'StatefulSet'
+            and (d.get('metadata') or {}).get('name') == 'bleater-redis'):
+        # Strip server-injected metadata fields that would conflict with
+        # apply (resourceVersion, uid, etc. are managed by k8s).
+        md = d.get('metadata') or {}
+        for f in ('creationTimestamp', 'resourceVersion', 'uid',
+                  'generation', 'managedFields', 'selfLink'):
+            md.pop(f, None)
+        d.pop('status', None)
+        # Add ArgoCD tracking annotation so the resource is recognized
+        # as belonging to bleater-platform Application.
+        ann = md.setdefault('annotations', {})
+        ann['argocd.argoproj.io/tracking-id'] = (
+            'bleater-platform:apps/StatefulSet:bleater/bleater-redis')
+        # Resource-level sync-options annotation so ArgoCD treats this
+        # specific resource with Force+Replace semantics (delete-recreate
+        # on immutable conflicts). This is independent of any app-level
+        # syncOptions and is read from BOTH live and desired states.
+        ann['argocd.argoproj.io/sync-options'] = 'Force=true,Replace=true'
+        sys.stdout.write(yaml.safe_dump(d, default_flow_style=False))
+        break
+else:
+    sys.stderr.write('no bleater-redis sts found in snapshot\n')
+    sys.exit(1)
+PYEOF
+if [ -s /tmp/redis-sts-from-chart.yaml ]; then
+  # SSA apply with manager=argocd-controller so the live resource has
+  # fields owned by Argo from the start. No CSA->SSA migration needed
+  # when Argo's sync subsequently runs.
+  if kubectl apply -f /tmp/redis-sts-from-chart.yaml \
+       --server-side --field-manager=argocd-controller \
+       --force-conflicts 2>&1 | head -5; then
+    echo "[solution] bleater-redis sts pre-applied via SSA (manager=argocd-controller)"
+  else
+    echo "[solution] WARN: pre-apply failed; ArgoCD will create from chart instead"
+  fi
+else
+  echo "[solution] WARN: could not extract bleater-redis sts from snapshot:"
+  cat /tmp/redis-sts-extract.err 2>/dev/null | head -3
+fi
 
 echo "[solution] Restoring ArgoCD auto-sync + persistent Replace=true syncOption on bleater-platform..."
 # Two patches, separately, to avoid clobbering the existing syncOptions
@@ -465,8 +530,17 @@ kubectl -n argocd patch application bleater-platform --type=merge \
   -p='{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}' \
   >/dev/null 2>&1 || true
 
-# Step 2: ensure Replace=true is in spec.syncPolicy.syncOptions (idempotent)
-python3 - <<'PYEOF' 2>&1 || echo "[solution] WARN: Replace=true syncOption patch failed"
+# Step 2: ensure spec.syncPolicy.syncOptions has Replace=true,
+# ServerSideApply=true, AND RespectIgnoreDifferences=true. The last one
+# is critical: by default ignoreDifferences only affects diff visibility
+# in ArgoCD's UI — it does NOT exclude those fields from sync apply
+# payloads. RespectIgnoreDifferences=true makes ArgoCD also EXCLUDE the
+# ignored fields (our `.spec.volumeClaimTemplates`) from what it sends
+# to the k8s API. Without it, even with vct in ignoreDifferences, the
+# sync still sends the chart's vct to k8s and hits "Forbidden: updates
+# to statefulset spec for fields other than..." because vct is
+# k8s-immutable.
+python3 - <<'PYEOF' 2>&1 || echo "[solution] WARN: syncOptions patch failed"
 import json, subprocess, sys
 try:
     out = subprocess.check_output(
@@ -479,13 +553,12 @@ except Exception as e:
     sys.exit(0)
 sp = app.setdefault("spec", {}).setdefault("syncPolicy", {})
 opts = sp.get("syncOptions") or []
+desired = ["Replace=true", "ServerSideApply=true", "RespectIgnoreDifferences=true"]
 changed = False
-if "Replace=true" not in opts:
-    opts.append("Replace=true")
-    changed = True
-if "ServerSideApply=true" not in opts:
-    opts.append("ServerSideApply=true")
-    changed = True
+for opt in desired:
+    if opt not in opts:
+        opts.append(opt)
+        changed = True
 sp["syncOptions"] = opts
 if changed:
     patch = json.dumps({"spec": {"syncPolicy": {"syncOptions": opts}}})
