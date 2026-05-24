@@ -16,14 +16,16 @@ between-subscore checks are independent code paths.
          AND reverters planted on the Redis sts itself.
       a2 argocd_application_synced  (CLUSTER-STATE AUDIT)
          The bleater-platform ArgoCD Application must have
-         spec.syncPolicy.automated.selfHeal == true AND .prune == true
-         AND status.sync.status == 'Synced'. selfHeal and prune are
-         semantically distinct: selfHeal reverts modifications, prune
-         removes orphaned out-of-band resources. Agents who set only
-         selfHeal leave the planted reverter CronJobs/Deployments
-         unowned by the Application — they linger across the next
-         reconcile. Setup.sh strips automated sync entirely; a correct
-         cleanup restores both flags.
+         spec.syncPolicy.automated.selfHeal == true AND .prune == true.
+         selfHeal and prune are semantically distinct: selfHeal reverts
+         modifications, prune removes orphaned out-of-band resources.
+         Agents who set only selfHeal leave the planted reverter
+         CronJobs/Deployments unowned by the Application — they linger
+         across the next reconcile. Setup.sh strips automated sync
+         entirely; a correct cleanup restores both flags. (The
+         status.sync.status == 'Synced' clause was dropped: ArgoCD
+         cannot reach Synced against a chart with immutable-vct
+         conflicts on the bleater-redis StatefulSet in this snapshot.)
       a3 source_repo_aligned  (GITOPS SOURCE-OF-TRUTH AUDIT)
          The bleater-redis StatefulSet manifest inside the bleater-
          manifests Gitea repo (which ArgoCD pulls from) must have
@@ -280,10 +282,12 @@ def subscore_a_persistence_durability():
                                               bleater-platform ArgoCD
                                               Application has
                                               spec.syncPolicy.automated
-                                              set AND status.sync.status
-                                              == 'Synced'. Both ensure
-                                              the next drift event
-                                              auto-reconciles.
+                                              with selfHeal AND prune
+                                              both true (the agent's
+                                              re-enable action). The
+                                              Synced status check was
+                                              dropped — see _a2's
+                                              docstring for rationale.
     a3 source_repo_aligned                  — GitOps source-of-truth
                                               audit. The bleater-redis
                                               StatefulSet manifest in
@@ -319,16 +323,23 @@ _ARGOCD_APP = "bleater-platform"
 
 def _a2_argocd_reconciled():
     """Verify the bleater-platform ArgoCD Application is back in a healthy
-    self-reconciling state. Three binary conditions all required:
+    self-reconciling state. Two binary conditions required:
       1. spec.syncPolicy.automated.selfHeal == true (mods get reverted).
       2. spec.syncPolicy.automated.prune == true (orphans get removed).
-      3. status.sync.status == 'Synced' (deployed state matches manifests).
     selfHeal and prune are semantically distinct — agents commonly set
     selfHeal but forget prune, leaving orphaned reverter workloads
-    around even though the sts itself reconciles. The v42 behavioral
-    drift-injection variant was dropped: it caught zero agents in 5
-    rollouts (5/5 passed), confirming the behavioral step is downstream
-    of the same precondition as the spec check.
+    around even though the sts itself reconciles.
+
+    The status.sync.status == 'Synced' check was previously gated here
+    but is dropped: in this snapshot, ArgoCD cannot reach Synced against
+    a chart whose StatefulSet volumeClaimTemplates differ from any
+    live shape (k8s rejects the apply with "Forbidden: updates to
+    statefulset spec for fields other than..." because vct is
+    k8s-immutable on existing StatefulSets, and ArgoCD's Replace=true
+    syncOption uses kubectl replace without --force so it hits the
+    same wall). Checking only selfHeal+prune verifies the agent's
+    actual action (the patch) without depending on Argo's convergence
+    behavior, which has intrinsic environmental limits.
     Returns (ok, detail)."""
     rc_a, auto, _ = run(
         ["kubectl", "-n", _ARGOCD_NS, "get", "application", _ARGOCD_APP,
@@ -346,8 +357,6 @@ def _a2_argocd_reconciled():
                  .get("syncPolicy") or {}).get("automated") or {}
     self_heal = bool(automated.get("selfHeal"))
     prune = bool(automated.get("prune"))
-    sync = (((app.get("status") or {}).get("sync") or {})
-            .get("status") or "").strip()
     if not self_heal:
         return False, ("ArgoCD %s spec.syncPolicy.automated.selfHeal is not "
                        "true — modifications will not auto-revert, so a "
@@ -359,11 +368,7 @@ def _a2_argocd_reconciled():
                        "planted reverter CronJobs/Deployments) will not "
                        "be auto-removed on the next reconcile" %
                        _ARGOCD_APP)
-    if sync != "Synced":
-        return False, ("ArgoCD %s status.sync.status=%r (expected 'Synced') "
-                       "— live cluster diverges from GitOps manifests" %
-                       (_ARGOCD_APP, sync))
-    return True, ("ArgoCD %s is Synced with selfHeal=true AND prune=true" %
+    return True, ("ArgoCD %s has selfHeal=true AND prune=true" %
                   _ARGOCD_APP)
 
 
