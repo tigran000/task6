@@ -1,6 +1,6 @@
 # HANDOFF — redis-persistence-drift
 
-**Last updated:** 2026-05-24 (post-v54 push, drop Synced check + revert sts handling)
+**Last updated:** 2026-05-24 (post-v55 push, close /tmp answer-leak)
 
 ## TL;DR
 
@@ -20,7 +20,7 @@ would regress the cluster on the next reconcile. Projected mean
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** v54 (pushed 2026-05-24, grader drops Synced check; solution.sh reverts to v47-style sts handling)
+- **Current version:** v55 (pushed 2026-05-24, /tmp answer-leak removed; solution.sh restores via Gitea commit history)
 - **VM:** `tigranharutyunyan59@34.186.153.63`, files at `~/task/`
 - **Local repo:** `/Users/tigran/task6`, GitHub `tigran000/task6`, master branch
 - **Runtime:** biggie-max-nebula, strict `0 < X < 0.50` ceiling
@@ -81,7 +81,8 @@ would regress the cluster on the next reconcile. Projected mean
 | v51 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | No-Op validation failed at SETUP. Setup.sh's `op:remove /spec/syncPolicy/automated` silently failed when path absent; Argo auto-sync stayed on; Argo recreated sts during setup's delete-then-apply window |
 | v52 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | Setup.sh now succeeds (hardening worked) but a2 OutOfSync persisted. Diagnostic confirmed `Replace=true` IS in effect ("error when replacing /dev/shm/...") but kubectl replace ≠ kubectl replace --force; immutable error continues |
 | v53 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | a2 still OutOfSync (RespectIgnoreDifferences likely not supported in this Argo version) AND b2 newly broke (SSA pre-apply with argocd-controller manager conflicted with grader's default-manager patches). Score 0.0 |
-| v54 | a1+a2(no-Synced)+a3 | b1+b2+b3 | pending | Surrender on Synced convergence: grader's a2 now checks only selfHeal+prune (the agent's actual action). Solution.sh reverted to v47-style sts handling (kubectl apply, no SSA tricks) to restore b2 |
+| v54 | a1+a2(no-Synced)+a3 | b1+b2+b3 | 0.50 mean | 5 rollouts. a3 5/5 (saturated), b3 dropped to 2/5 (new variance). Score distribution `0,0.5,0.5,0.5,1.0` |
+| v55 | a1+a2(no-Synced)+a3 | b1+b2+b3 | pending | Closed reviewer-flagged answer-leak: `/tmp/bleater-manifests-original.b64` (chmod 644, world-readable, was a direct-lookup bypass for a3). solution.sh now restores via Gitea commits API (fetches previous-commit content). setup.sh no longer creates any /tmp scratch file. |
 
 ## v44 per-item (most recent batched data)
 

@@ -539,15 +539,6 @@ except Exception:
     exit 1
   fi
 
-  # Snapshot the ORIGINAL pristine content so solution.sh can restore it
-  # byte-identically. Without this, a python yaml round-trip on the file
-  # would reformat every non-bleater-redis doc too — and any field-order
-  # / quoting drift those round-trips introduce makes ArgoCD see drift
-  # on resources the agent never modified, killing a2 (OutOfSync).
-  echo "$CURRENT_CONTENT_B64" | tr -d '\n' > /tmp/bleater-manifests-original.b64
-  chmod 644 /tmp/bleater-manifests-original.b64
-  echo "[setup] Snapshotted original bleater-manifests/templates/infrastructure.yaml ($(wc -c < /tmp/bleater-manifests-original.b64) bytes base64)"
-
   BROKEN_CONTENT_B64=$(echo "$CURRENT_CONTENT_B64" | tr -d '\n' | base64 -d | python3 -c "
 import sys, yaml
 text = sys.stdin.read()

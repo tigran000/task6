@@ -369,12 +369,12 @@ except Exception: pass
 fi
 
 echo "[solution] Fixing the bleater-redis manifest in bleater-manifests (source of truth)..."
-# Setup.sh corrupted templates/infrastructure.yaml via a python YAML
-# round-trip that touches EVERY doc in the file (not just bleater-redis
-# sts). Restoring byte-identically from setup.sh's pre-corruption
-# snapshot is the only safe restore — any re-emit-from-AST approach
-# risks introducing field-order/quoting drift on the other resources
-# in the file, which makes ArgoCD see drift and fails a2 (OutOfSync).
+# Restore the pre-corruption content by fetching it from Gitea's commit
+# history (the previous commit on this file, before setup.sh's corruption).
+# This avoids any agent-readable scratch file: solution.sh derives the
+# original content via the same Gitea API the agent has access to, but
+# solution.sh itself is task-private so its restoration logic is not
+# exposed as a lookup shortcut.
 SOLUTION_TOKEN_RESP=$(curl -s -u "${GITEA_USER}:${GITEA_PASS}" \
   --connect-timeout 5 --max-time 15 \
   -H "Content-Type: application/json" \
@@ -382,15 +382,45 @@ SOLUTION_TOKEN_RESP=$(curl -s -u "${GITEA_USER}:${GITEA_PASS}" \
   "${GITEA_URL}/api/v1/users/${GITEA_USER}/tokens" 2>/dev/null || true)
 SOLUTION_TOKEN=$(echo "$SOLUTION_TOKEN_RESP" | grep -o '"sha1":"[^"]*"' | head -n1 | cut -d'"' -f4)
 
-if [ -n "$SOLUTION_TOKEN" ] && [ -f /tmp/bleater-manifests-original.b64 ]; then
-  ORIGINAL_CONTENT_B64=$(cat /tmp/bleater-manifests-original.b64 | tr -d '\n')
-  # Get current sha (after setup.sh's corruption commit)
+if [ -n "$SOLUTION_TOKEN" ]; then
+  # Find the sha of the commit BEFORE setup.sh's corruption commit.
+  # Gitea's commits API returns latest-first, so commits[1] is the
+  # pre-corruption state (commits[0] is setup.sh's corruption).
+  COMMITS_JSON=$(curl -s -H "Authorization: token ${SOLUTION_TOKEN}" \
+    --connect-timeout 5 --max-time 15 \
+    "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-manifests/commits?path=templates/infrastructure.yaml&limit=5")
+  PREV_SHA=$(echo "$COMMITS_JSON" | python3 -c "
+import json, sys
+try:
+    commits = json.load(sys.stdin)
+    if isinstance(commits, list) and len(commits) >= 2:
+        print(commits[1].get('sha', ''))
+except Exception:
+    pass" 2>/dev/null)
+
+  # Fetch the file content at the pre-corruption sha
+  ORIGINAL_CONTENT_B64=""
+  if [ -n "$PREV_SHA" ]; then
+    PREV_FILE_RESP=$(curl -s -H "Authorization: token ${SOLUTION_TOKEN}" \
+      --connect-timeout 5 --max-time 15 \
+      "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-manifests/contents/templates/infrastructure.yaml?ref=${PREV_SHA}")
+    ORIGINAL_CONTENT_B64=$(echo "$PREV_FILE_RESP" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    print((d.get('content', '') or '').replace(chr(10), ''))
+except Exception:
+    pass" 2>/dev/null)
+  fi
+
+  # Get the CURRENT sha (after setup.sh's corruption) for the PUT payload
   CURRENT_FILE_RESP=$(curl -s -H "Authorization: token ${SOLUTION_TOKEN}" \
     --connect-timeout 5 --max-time 15 \
     "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-manifests/contents/templates/infrastructure.yaml")
-  CURRENT_SHA=$(echo "$CURRENT_FILE_RESP" | python3 -c "import json,sys;
+  CURRENT_SHA=$(echo "$CURRENT_FILE_RESP" | python3 -c "
+import json, sys
 try:
-    print(json.load(sys.stdin).get('sha',''))
+    print(json.load(sys.stdin).get('sha', ''))
 except Exception:
     pass" 2>/dev/null)
 
@@ -409,12 +439,12 @@ print(json.dumps({
       -H "Content-Type: application/json" \
       -d "$PUT_PAYLOAD" \
       "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-manifests/contents/templates/infrastructure.yaml")
-    echo "[solution] bleater-manifests restored byte-identical to original (HTTP ${PUT_HTTP})"
+    echo "[solution] bleater-manifests restored from previous commit ${PREV_SHA:0:7} (HTTP ${PUT_HTTP})"
   else
-    echo "[solution] WARN: missing sha or snapshot (sha='${CURRENT_SHA}', snapshot_bytes=${#ORIGINAL_CONTENT_B64})"
+    echo "[solution] WARN: missing sha or content (current='${CURRENT_SHA}', prev='${PREV_SHA}', bytes=${#ORIGINAL_CONTENT_B64})"
   fi
 else
-  echo "[solution] WARN: no Gitea token or no snapshot at /tmp/bleater-manifests-original.b64"
+  echo "[solution] WARN: no Gitea token"
 fi
 
 
