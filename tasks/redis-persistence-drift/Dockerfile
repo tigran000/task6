@@ -13,10 +13,11 @@ FROM us-central1-docker.pkg.dev/bespokelabs/nebula-devops-registry/nebula-devops
 RUN set -eux; \
     install -d /workdir/images; \
     if ! command -v crane >/dev/null 2>&1; then \
-      curl -sL https://github.com/google/go-containerregistry/releases/download/v0.16.1/go-containerregistry_Linux_x86_64.tar.gz \
+      timeout 120 curl --connect-timeout 10 --max-time 90 --retry 2 --retry-delay 5 -fsSL \
+        https://github.com/google/go-containerregistry/releases/download/v0.16.1/go-containerregistry_Linux_x86_64.tar.gz \
         | tar -xzC /usr/local/bin/ crane; \
     fi; \
-    crane pull bitnamilegacy/kubectl:1.28 /workdir/images/bitnami-kubectl.tar
+    timeout 300 crane pull bitnamilegacy/kubectl:1.28 /workdir/images/bitnami-kubectl.tar
 
 ENV DISPLAY_NUM=1
 ENV COMPUTER_HEIGHT_PX=768
