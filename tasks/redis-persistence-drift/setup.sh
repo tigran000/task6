@@ -395,25 +395,36 @@ spec:
               kubectl -n bleater patch statefulset bleater-redis --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/command","value":["redis-server","--save","","--appendonly","no","--dir","/tmp"]}]' >/dev/null 2>&1 || true
 YAML
 
-# Pre-pull bitnami/kubectl:1.28 into k3s's containerd cache so the watchdog
-# CronJob can spawn its pod during the agent's air-gapped session without
-# needing to reach a registry. We trigger the pull via a short-lived Pod
-# and wait for it to Succeed; if it fails, the watchdog degrades gracefully
-# to ImagePullBackOff (no setup crash, just a less-effective reverter).
-echo "[setup] Pre-pulling bitnami/kubectl:1.28 into the node image cache..."
-kubectl -n monitoring run kubectl-prepull \
-  --image=bitnami/kubectl:1.28 --restart=Never --command \
-  -- sh -c "exit 0" >/dev/null 2>&1 || true
-PRE_WAIT=0
-while [ $PRE_WAIT -lt 180 ]; do
-  PRE_PHASE=$(kubectl -n monitoring get pod kubectl-prepull -o jsonpath='{.status.phase}' 2>/dev/null || true)
-  if [ "$PRE_PHASE" = "Succeeded" ] || [ "$PRE_PHASE" = "Failed" ]; then
-    break
+# Import bitnami/kubectl:1.28 into k3s's containerd cache from the
+# tarball baked into the image at Dockerfile build time. Air-gap
+# compliant: no network calls at test time. v55 rollouts proved the
+# previous runtime-pull approach (kubectl run kubectl-prepull) failed
+# 100% in the air-gapped environment — || true masked the failure but
+# the redis-config-watchdog CronJob ended up ImagePullBackOff,
+# silently neutralizing one of the three planted reverters.
+echo "[setup] Importing bitnami/kubectl:1.28 from baked tarball (air-gap compliant)..."
+if [ -f /workdir/images/bitnami-kubectl.tar ]; then
+  if k3s ctr images import /workdir/images/bitnami-kubectl.tar >/dev/null 2>&1; then
+    echo "[setup] Image imported into k3s containerd cache"
+  else
+    echo "[setup] WARN: k3s ctr images import failed"
   fi
-  sleep 3
-  PRE_WAIT=$((PRE_WAIT + 3))
-done
-kubectl -n monitoring delete pod kubectl-prepull --ignore-not-found --force --grace-period=0 >/dev/null 2>&1 || true
+else
+  echo "[setup] WARN: /workdir/images/bitnami-kubectl.tar missing; falling back to runtime pull (will likely fail in air-gap)"
+  kubectl -n monitoring run kubectl-prepull \
+    --image=bitnami/kubectl:1.28 --restart=Never --command \
+    -- sh -c "exit 0" >/dev/null 2>&1 || true
+  PRE_WAIT=0
+  while [ $PRE_WAIT -lt 180 ]; do
+    PRE_PHASE=$(kubectl -n monitoring get pod kubectl-prepull -o jsonpath='{.status.phase}' 2>/dev/null || true)
+    if [ "$PRE_PHASE" = "Succeeded" ] || [ "$PRE_PHASE" = "Failed" ]; then
+      break
+    fi
+    sleep 3
+    PRE_WAIT=$((PRE_WAIT + 3))
+  done
+  kubectl -n monitoring delete pod kubectl-prepull --ignore-not-found --force --grace-period=0 >/dev/null 2>&1 || true
+fi
 
 # Wait for Gitea API to be reachable before attempting token creation.
 # Previous versions skipped this and silently passed an empty token to the
