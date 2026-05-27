@@ -1,6 +1,6 @@
 # HANDOFF — redis-persistence-drift
 
-**Last updated:** 2026-05-27 (post-v57 push, bitnami/kubectl image baked into Dockerfile)
+**Last updated:** 2026-05-27 (post-v59 push, switched to bitnamilegacy/kubectl:1.28 — bitnami/ deprecated from docker.io)
 
 ## TL;DR
 
@@ -20,7 +20,7 @@ would regress the cluster on the next reconcile. Projected mean
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** v57 (pushed 2026-05-27, bitnami/kubectl image baked at Dockerfile build time + stale subfolder cleanup)
+- **Current version:** v59 (pushed 2026-05-27, kubectl image source switched to bitnamilegacy/ namespace)
 - **VM:** `tigranharutyunyan59@34.186.153.63`, files at `~/task/`
 - **Local repo:** `/Users/tigran/task6`, GitHub `tigran000/task6`, master branch
 - **Runtime:** biggie-max-nebula, strict `0 < X < 0.50` ceiling
@@ -84,7 +84,9 @@ would regress the cluster on the next reconcile. Projected mean
 | v54 | a1+a2(no-Synced)+a3 | b1+b2+b3 | 0.50 mean | 5 rollouts. a3 5/5 (saturated), b3 dropped to 2/5 (new variance). Score distribution `0,0.5,0.5,0.5,1.0` |
 | v55 | a1+a2(no-Synced)+a3 | b1+b2+b3 | pending | Closed reviewer-flagged answer-leak: `/tmp/bleater-manifests-original.b64`. solution.sh now restores via Gitea commits API (fetches previous-commit content). |
 | v56 | a1+a2(no-Synced)+a3 | b1+b2+b3 | n/a | VM cleanup only: deleted stale `~/task/redis-persistence-drift/` subfolder that was getting pushed with every version. |
-| v57 | a1+a2(no-Synced)+a3 | b1+b2+b3 | pending | Fixed Anish's air-gap finding: bitnami/kubectl:1.28 pre-cached at Dockerfile build time via crane → tarball at /workdir/images/, imported into k3s via `k3s ctr images import` in setup.sh. The previous runtime `kubectl run kubectl-prepull` failed 100% in v55 rollouts (air-gap blocked the docker.io pull), leaving redis-config-watchdog as dead-on-arrival ImagePullBackOff — one of 3 reverters never functioned. Fix should restore a1's full variance signal. |
+| v57 | a1+a2(no-Synced)+a3 | b1+b2+b3 | invalid | Validator failed at Dockerfile build: `GET https://index.docker.io/v2/bitnami/kubectl/manifests/1.28:` — Bitnami deprecated free docker.io images in 2024, the `bitnami/kubectl:1.28` tag is no longer pullable. Confirms why v55's runtime pull silently failed too. |
+| v58 | a1+a2(no-Synced)+a3 | b1+b2+b3 | invalid | Parallel push (hardened setup.sh: removed runtime-pull fallback, made image-import failure LOUD) but still referenced the dead `bitnami/kubectl:1.28` |
+| v59 | a1+a2(no-Synced)+a3 | b1+b2+b3 | pending | Switched both Dockerfile crane source AND watchdog CronJob image to `bitnamilegacy/kubectl:1.28` (Bitnami's legacy archive namespace) — still available, still kubectl. |
 
 ## v44 per-item (most recent batched data)
 

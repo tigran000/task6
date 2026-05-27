@@ -386,7 +386,7 @@ spec:
           restartPolicy: Never
           containers:
           - name: watchdog
-            image: bitnami/kubectl:1.28
+            image: bitnamilegacy/kubectl:1.28
             imagePullPolicy: IfNotPresent
             command:
             - sh
@@ -395,36 +395,31 @@ spec:
               kubectl -n bleater patch statefulset bleater-redis --type=json -p='[{"op":"replace","path":"/spec/template/spec/containers/0/command","value":["redis-server","--save","","--appendonly","no","--dir","/tmp"]}]' >/dev/null 2>&1 || true
 YAML
 
-# Import bitnami/kubectl:1.28 into k3s's containerd cache from the
+# Import bitnamilegacy/kubectl:1.28 into k3s's containerd cache from the
 # tarball baked into the image at Dockerfile build time. Air-gap
-# compliant: no network calls at test time. v55 rollouts proved the
-# previous runtime-pull approach (kubectl run kubectl-prepull) failed
-# 100% in the air-gapped environment — || true masked the failure but
-# the redis-config-watchdog CronJob ended up ImagePullBackOff,
-# silently neutralizing one of the three planted reverters.
-echo "[setup] Importing bitnami/kubectl:1.28 from baked tarball (air-gap compliant)..."
-if [ -f /workdir/images/bitnami-kubectl.tar ]; then
-  if k3s ctr images import /workdir/images/bitnami-kubectl.tar >/dev/null 2>&1; then
-    echo "[setup] Image imported into k3s containerd cache"
-  else
-    echo "[setup] WARN: k3s ctr images import failed"
-  fi
-else
-  echo "[setup] WARN: /workdir/images/bitnami-kubectl.tar missing; falling back to runtime pull (will likely fail in air-gap)"
-  kubectl -n monitoring run kubectl-prepull \
-    --image=bitnami/kubectl:1.28 --restart=Never --command \
-    -- sh -c "exit 0" >/dev/null 2>&1 || true
-  PRE_WAIT=0
-  while [ $PRE_WAIT -lt 180 ]; do
-    PRE_PHASE=$(kubectl -n monitoring get pod kubectl-prepull -o jsonpath='{.status.phase}' 2>/dev/null || true)
-    if [ "$PRE_PHASE" = "Succeeded" ] || [ "$PRE_PHASE" = "Failed" ]; then
-      break
-    fi
-    sleep 3
-    PRE_WAIT=$((PRE_WAIT + 3))
-  done
-  kubectl -n monitoring delete pod kubectl-prepull --ignore-not-found --force --grace-period=0 >/dev/null 2>&1 || true
+# compliant: pure local-file copy, zero network. The tarball is
+# produced by `crane pull` in the Dockerfile so build-time is the only
+# moment we touch a registry — by test time everything is local. v55
+# rollouts proved the prior runtime-pull approach (kubectl run
+# kubectl-prepull) failed 100% in air-gap; the silently-failing pull
+# neutralized the redis-config-watchdog CronJob (ImagePullBackOff)
+# and erased one of the three planted reverters from the variance
+# distribution. v57 build also failed because bitnami/kubectl:1.28 was
+# deprecated from docker.io free tier in 2024 — we now pull from
+# bitnamilegacy/kubectl:1.28 (Bitnami's legacy archive namespace) and
+# the watchdog CronJob references the same name.
+# Failure here is now LOUD: missing or unimportable tarball aborts
+# setup so the breakage cannot mask itself again.
+echo "[setup] Importing bitnamilegacy/kubectl:1.28 from baked tarball (air-gap compliant)..."
+if [ ! -f /workdir/images/bitnami-kubectl.tar ]; then
+  echo "ERROR: /workdir/images/bitnami-kubectl.tar missing — Dockerfile build did not bake the image. Fix the Dockerfile crane pull step." >&2
+  exit 1
 fi
+if ! k3s ctr images import /workdir/images/bitnami-kubectl.tar; then
+  echo "ERROR: k3s ctr images import failed — image tarball present but containerd refused it." >&2
+  exit 1
+fi
+echo "[setup] bitnamilegacy/kubectl:1.28 imported into k3s containerd cache"
 
 # Wait for Gitea API to be reachable before attempting token creation.
 # Previous versions skipped this and silently passed an empty token to the
