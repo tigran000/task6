@@ -4,7 +4,7 @@ Two equal-weight, binary, orthogonal subscores. Each is an AND-gate of
 one or more related checks. Within-subscore checks share a theme;
 between-subscore checks are independent code paths.
 
-  A persistence_durability  (weight 1/2) — AND-gate of 3 atoms.
+  A persistence_durability  (weight 1/2) — AND-gate of 2 atoms.
       a1 no_reverter_sidecar_in_bleat_service  (BEHAVIOR-BASED SPEC AUDIT)
          Per-resource scan of _REVERTER_SIDECAR_RESOURCES — Deployments,
          the bleater-redis StatefulSet, and CronJob templates across the
@@ -13,32 +13,29 @@ between-subscore checks are independent code paths.
          SET disabling persistence, and kubectl-patch loops flipping the
          bleater-redis sts command-args back. Catches quiesced reverters
          (CronJob spec.suspend=true, scale-to-0, host-Deployment rolled)
-         AND reverters planted on the Redis sts itself.
-      a2 argocd_application_synced  (CLUSTER-STATE AUDIT)
-         The bleater-platform ArgoCD Application must have
-         spec.syncPolicy.automated.selfHeal == true AND .prune == true.
-         selfHeal and prune are semantically distinct: selfHeal reverts
-         modifications, prune removes orphaned out-of-band resources.
-         Agents who set only selfHeal leave the planted reverter
-         CronJobs/Deployments unowned by the Application — they linger
-         across the next reconcile. Setup.sh strips automated sync
-         entirely; a correct cleanup restores both flags. (The
-         status.sync.status == 'Synced' clause was dropped: ArgoCD
-         cannot reach Synced against a chart with immutable-vct
-         conflicts on the bleater-redis StatefulSet in this snapshot.)
-      a3 source_repo_aligned  (GITOPS SOURCE-OF-TRUTH AUDIT)
-         The bleater-redis StatefulSet manifest inside the bleater-
-         manifests Gitea repo (which ArgoCD pulls from) must have
-         --appendonly yes AND a non-empty volumeClaimTemplates entry
-         named 'data'. Setup.sh corrupts this file in master so that
-         agents who only fix the LIVE cluster leave a time bomb: the
-         moment ArgoCD selfHeal reconciles from the still-broken
-         manifest, the cluster regresses. The "hotfixes get quietly
-         rolled back by the platform reconciliation loop — make sure
-         your changes land somewhere they will stick" hint in the P1
-         body is the symptom-level pointer for this atom; agents who
-         miss the git-vs-live distinction fail here regardless of how
-         well they cleaned the cluster.
+         AND reverters planted on the Redis sts itself. Deleting a
+         "required" workload (bleat-service, timeline-service, the Redis
+         sts) to dodge the audit fails — that breaks the platform, it
+         does not fix the incident.
+      a2 redis_persistence_restored  (POSITIVE PERSISTENCE CHECK)
+         The bleater-redis StatefulSet must be back in a durable shape:
+         the redis container command has --appendonly yes (not no), a
+         non-empty --save interval, AND the sts declares a
+         volumeClaimTemplate named 'data' so /data is PVC-backed rather
+         than emptyDir. This closes the gap a1 cannot see: the original
+         breakage (`redis-server --save "" --appendonly no --dir /tmp`)
+         is the main container's startup command, NOT a reverter-shaped
+         loop, so a1 passes on a fully-unfixed cluster. Without a2 the
+         subscore awarded full credit while Redis was still ephemeral —
+         or even while the whole sts/services were deleted.
+
+      Prior a2 (argocd_application_synced) and a3 (source_repo_aligned)
+      atoms were dropped as confirmed dead weight (both saturated 5/5 on
+      biggie-max-nebula and daydream batches per HANDOFF: "every config-
+      presence atom saturates within 1-2 versions"). Their helpers +
+      setup-side manifest-corruption block were removed. The positive
+      persistence check above replaces them as A's coupling to the actual
+      incident outcome.
 
   B alert_observability     (weight 1/2) — AND-gate of 3 atoms.
       b1 alert_rule_loaded
@@ -59,8 +56,11 @@ between-subscore checks are independent code paths.
          Walks Grafana's notification policy tree top-down against the
          matched rule's labels (curl /api/v1/provisioning/policies from
          inside the Grafana pod). The matched receiver must not be in
-         the blackhole set. Prometheus-store rules fail-open (this
-         snapshot has no Alertmanager wired).
+         the blackhole set. Prometheus-store rules route via Alertmanager;
+         since this snapshot wires none, they fail CLOSED unless the agent
+         brings up an Alertmanager (checked via Prometheus
+         /api/v1/alertmanagers) — an alert that cannot notify anyone is
+         not "pageable".
 
 A and B are fully independent. A is measured against the cluster state
 the agent left behind. Before B starts measuring, the grader takes
@@ -151,12 +151,21 @@ def wait_for_redis(timeout=180):
 # bleater-redis catches sidecars planted on the Redis sts itself, which
 # the v25-v29 audit missed.
 _REVERTER_SIDECAR_RESOURCES = [
-    ("deploy", "bleater-bleat-service", NS),
-    ("deploy", "bleater-timeline-service", NS),
-    ("sts", "bleater-redis", NS),
-    ("cronjob", "cache-config-syncer", NS),
-    ("cronjob", "redis-fsync-tuner", PROM_NS),
-    ("cronjob", "redis-config-watchdog", PROM_NS),
+    # Tuple = (kind, name, namespace, classification).
+    # classification ∈ {"required", "reverter"}:
+    #   "required": a legitimate workload that must exist (deletion = FAIL).
+    #              "absent" no longer counts as cleanup — wholesale-deleting
+    #              the app to dodge the sidecar check would break the
+    #              platform, not fix the incident.
+    #   "reverter": a setup-planted reverter mechanism (deletion = PASS).
+    #              Cleaning up the reverter is the intended fix; absent is
+    #              the strongest cleanup signal.
+    ("deploy", "bleater-bleat-service", NS, "required"),
+    ("deploy", "bleater-timeline-service", NS, "required"),
+    ("sts", "bleater-redis", NS, "required"),
+    ("cronjob", "cache-config-syncer", NS, "reverter"),
+    ("cronjob", "redis-fsync-tuner", PROM_NS, "reverter"),
+    ("cronjob", "redis-config-watchdog", PROM_NS, "reverter"),
 ]
 
 
@@ -232,24 +241,30 @@ def _a1_spec_audit_no_reverter_sidecar():
     """Behavior-based spec audit across Deployments, StatefulSets, and
     CronJob templates. For each entry in _REVERTER_SIDECAR_RESOURCES,
     fetch the live spec and fail if ANY container in the pod template
-    looks like a reverter. Resources entirely deleted count as PASS.
-    Catches:
-      - quiesced reverters (CronJob spec.suspend=true) the live poll misses
-      - reverters planted on the Redis sts itself (covers the
-        StatefulSet container list directly, not only Deployments)
-      - kubectl-patch-shaped watchdog containers (catches redis-config-
-        watchdog in its CronJob jobTemplate)
+    looks like a reverter.
+
+    Absence handling depends on classification:
+      - "required" (the app's own workloads): absent = FAIL. Deleting
+        the bleat-service, timeline-service, or bleater-redis is not a
+        valid way to clear the sidecar audit — the platform is broken
+        either way.
+      - "reverter" (setup-planted CronJobs): absent = PASS. Deleting
+        the planted reverter IS the intended cleanup.
     """
     per_resource = []
     overall_bad = []
+    deleted_required = []
     unreadable = []
-    for kind, name, namespace in _REVERTER_SIDECAR_RESOURCES:
+    for kind, name, namespace, classification in _REVERTER_SIDECAR_RESOURCES:
         containers = _resource_containers(kind, name, namespace)
         if containers is None:
             unreadable.append("%s/%s in %s" % (kind, name, namespace))
             continue
         if containers == "absent":
-            per_resource.append((kind, name, namespace, "absent", []))
+            if classification == "reverter":
+                per_resource.append((kind, name, namespace, "absent", []))
+                continue
+            deleted_required.append("%s/%s in %s" % (kind, name, namespace))
             continue
         reverter_names = [c.get("name", "?") for c in containers
                           if _is_reverter_shaped(c)]
@@ -257,6 +272,10 @@ def _a1_spec_audit_no_reverter_sidecar():
         per_resource.append((kind, name, namespace, all_names, reverter_names))
         if reverter_names:
             overall_bad.append((kind, name, namespace, reverter_names))
+    if deleted_required:
+        return False, ("required workload(s) were deleted instead of "
+                       "cleaned: %s — the platform cannot serve traffic "
+                       "without them" % deleted_required)
     if unreadable:
         return False, ("could not parse spec for resource(s): %s" % unreadable)
     if overall_bad:
@@ -266,246 +285,127 @@ def _a1_spec_audit_no_reverter_sidecar():
                   "(%s)" % [(k, n, ns) for k, n, ns, _, _ in per_resource])
 
 
+def _a2_redis_persistence_restored():
+    """Verify the bleater-redis StatefulSet is configured for durable
+    persistence. Catches the case a1 misses: the broken redis-server
+    command (`redis-server --save "" --appendonly no --dir /tmp`) is
+    the main container's startup args, NOT a reverter-shaped loop, so
+    _is_reverter_shaped returns False for it and a1 alone passes even
+    on an unfixed cluster.
+
+    Three binary conditions all required:
+      1. spec.template.spec.containers[0] command has --appendonly yes
+         (and not --appendonly no).
+      2. command's --save value is non-empty (RDB snapshots enabled).
+      3. spec.volumeClaimTemplates contains an entry named 'data' —
+         the /data mount must be PVC-backed, not emptyDir.
+
+    YAML 1.1 boolean coercion: unquoted `yes`/`no` parse to True/False
+    in Python — normalize before comparing.
+    Returns (ok, detail)."""
+    rc, out, _ = run(
+        KUBECTL + ["get", "sts", "bleater-redis", "-o", "json"],
+        timeout=15,
+    )
+    if rc != 0 or not (out or "").strip():
+        return False, ("bleater-redis StatefulSet is absent or unreadable "
+                       "(rc=%s) — the cache layer is gone" % rc)
+    try:
+        sts = json.loads(out)
+    except Exception:
+        return False, "bleater-redis StatefulSet JSON unparseable"
+    spec = sts.get("spec") or {}
+    containers = (((spec.get("template") or {}).get("spec") or {})
+                  .get("containers") or [])
+    redis_c = next((c for c in containers if c.get("name") == "redis"),
+                   None)
+    if redis_c is None:
+        return False, "bleater-redis sts has no container named 'redis'"
+    cmd_args = ((redis_c.get("command") or []) +
+                (redis_c.get("args") or []))
+    _ENABLED = {"yes", "on", "true"}
+    _DISABLED = {"no", "off", "false"}
+    appendonly = None
+    save_present = False
+    save_value = None
+    for i, arg in enumerate(cmd_args):
+        token = str(arg).strip().lower()
+        if token == "--appendonly" and i + 1 < len(cmd_args):
+            raw = cmd_args[i + 1]
+            if isinstance(raw, bool):
+                appendonly = "yes" if raw else "no"
+            else:
+                v = str(raw).strip().lower()
+                appendonly = ("yes" if v in _ENABLED else
+                              "no" if v in _DISABLED else v)
+        elif token == "--save" and i + 1 < len(cmd_args):
+            save_present = True
+            raw = cmd_args[i + 1]
+            save_value = "" if raw is None else str(raw).strip()
+    if appendonly == "no":
+        return False, ("bleater-redis sts command has --appendonly no — "
+                       "AOF disabled, cache wipes on every pod restart "
+                       "(command=%r)" % cmd_args)
+    if appendonly != "yes":
+        return False, ("bleater-redis sts command does not enable "
+                       "--appendonly yes (saw appendonly=%r, command=%r)"
+                       % (appendonly, cmd_args))
+    if save_present and save_value in ("", '""', "''"):
+        return False, ("bleater-redis sts command has --save \"\" — RDB "
+                       "snapshots disabled (command=%r)" % cmd_args)
+    vcts = spec.get("volumeClaimTemplates") or []
+    data_pvc = next((v for v in vcts
+                     if (v.get("metadata") or {}).get("name") == "data"),
+                    None)
+    if data_pvc is None:
+        return False, ("bleater-redis sts has no volumeClaimTemplate "
+                       "named 'data' — /data is ephemeral (emptyDir or "
+                       "missing)")
+    return True, ("bleater-redis sts has --appendonly yes, --save %r, "
+                  "and a 'data' volumeClaimTemplate" % save_value)
+
+
 def subscore_a_persistence_durability():
-    """AND-gate of 3 atoms answering: 'Will the cluster stay durably
-    persistent — free of latent reverter mechanisms, with the GitOps
-    reconciliation loop owning the live state, AND with the source-of-
-    truth manifest matching the desired persistent shape?'
+    """AND-gate of 2 atoms answering: 'Did the agent actually fix the
+    persistence incident — both removing the reverter mechanisms AND
+    restoring durable persistence to the live StatefulSet?'
+
     a1 no_reverter_sidecar_in_bleat_service — Behavior-based spec audit
                                               across Deployments, the
                                               bleater-redis StatefulSet,
                                               and CronJob templates. No
                                               container's command/args
                                               may match a reverter
-                                              pattern.
-    a2 argocd_application_synced            — Cluster-state audit. The
-                                              bleater-platform ArgoCD
-                                              Application has
-                                              spec.syncPolicy.automated
-                                              with selfHeal AND prune
-                                              both true (the agent's
-                                              re-enable action). The
-                                              Synced status check was
-                                              dropped — see _a2's
-                                              docstring for rationale.
-    a3 source_repo_aligned                  — GitOps source-of-truth
-                                              audit. The bleater-redis
-                                              StatefulSet manifest in
-                                              bleater-manifests
-                                              (templates/infrastructure.
-                                              yaml) has --appendonly yes
-                                              AND non-empty
-                                              volumeClaimTemplates named
-                                              'data'. Catches agents
-                                              who fix only the live
-                                              cluster while leaving the
-                                              git manifest corrupted —
-                                              ArgoCD selfHeal would
-                                              regress them on next
-                                              reconcile.
-    A prior behavioral data_survives_pod_restart atom was dropped:
-    agents reliably rebuild the redis sts from scratch, which drops any
-    setup-planted initContainer as a side effect — saturating the atom
-    in practice."""
+                                              pattern; deleting a required
+                                              workload to dodge the audit
+                                              fails (see _a1 docstring).
+    a2 redis_persistence_restored           — Positive check that the
+                                              bleater-redis sts is back in
+                                              a durable shape: --appendonly
+                                              yes, a non-empty --save, and a
+                                              'data' volumeClaimTemplate.
+                                              Catches the core breakage a1
+                                              cannot see — the broken
+                                              `redis-server --save ""
+                                              --appendonly no --dir /tmp`
+                                              startup command is not
+                                              reverter-shaped, so a1 alone
+                                              passes on an unfixed cluster.
+
+    The prior a2 (argocd_application_synced) and a3 (source_repo_aligned)
+    atoms were dropped as confirmed dead weight (both saturated 5/5).
+    Replacing them with this positive persistence check restores A's
+    coupling to the actual incident: an agent who only suppresses the
+    reverters but leaves Redis ephemeral now fails A. A is measured
+    against the agent's left-behind state and always runs before B's
+    isolation harness, so it reflects the agent's final cluster, not the
+    grader's temporary known-good patch."""
     a1_ok, a1_detail = _a1_spec_audit_no_reverter_sidecar()
-    a2_ok, a2_detail = _a2_argocd_reconciled()
-    a3_ok, a3_detail = _a3_source_repo_aligned()
-    return [int(a1_ok), int(a2_ok), int(a3_ok)], [
+    a2_ok, a2_detail = _a2_redis_persistence_restored()
+    return [int(a1_ok), int(a2_ok)], [
         ("no_reverter_sidecar_in_bleat_service", a1_ok, a1_detail),
-        ("argocd_application_synced", a2_ok, a2_detail),
-        ("source_repo_aligned", a3_ok, a3_detail),
+        ("redis_persistence_restored", a2_ok, a2_detail),
     ]
-
-
-_ARGOCD_NS = "argocd"
-_ARGOCD_APP = "bleater-platform"
-
-
-def _a2_argocd_reconciled():
-    """Verify the bleater-platform ArgoCD Application is back in a healthy
-    self-reconciling state. Two binary conditions required:
-      1. spec.syncPolicy.automated.selfHeal == true (mods get reverted).
-      2. spec.syncPolicy.automated.prune == true (orphans get removed).
-    selfHeal and prune are semantically distinct — agents commonly set
-    selfHeal but forget prune, leaving orphaned reverter workloads
-    around even though the sts itself reconciles.
-
-    The status.sync.status == 'Synced' check was previously gated here
-    but is dropped: in this snapshot, ArgoCD cannot reach Synced against
-    a chart whose StatefulSet volumeClaimTemplates differ from any
-    live shape (k8s rejects the apply with "Forbidden: updates to
-    statefulset spec for fields other than..." because vct is
-    k8s-immutable on existing StatefulSets, and ArgoCD's Replace=true
-    syncOption uses kubectl replace without --force so it hits the
-    same wall). Checking only selfHeal+prune verifies the agent's
-    actual action (the patch) without depending on Argo's convergence
-    behavior, which has intrinsic environmental limits.
-    Returns (ok, detail)."""
-    rc_a, auto, _ = run(
-        ["kubectl", "-n", _ARGOCD_NS, "get", "application", _ARGOCD_APP,
-         "-o", "json"],
-        timeout=15,
-    )
-    if rc_a != 0:
-        return False, ("could not read ArgoCD Application %s/%s "
-                       "(rc=%s)" % (_ARGOCD_NS, _ARGOCD_APP, rc_a))
-    try:
-        app = json.loads(auto)
-    except Exception:
-        return False, "ArgoCD Application JSON unparseable"
-    automated = ((app.get("spec") or {})
-                 .get("syncPolicy") or {}).get("automated") or {}
-    self_heal = bool(automated.get("selfHeal"))
-    prune = bool(automated.get("prune"))
-    if not self_heal:
-        return False, ("ArgoCD %s spec.syncPolicy.automated.selfHeal is not "
-                       "true — modifications will not auto-revert, so a "
-                       "future Helm-upgrade-style drift will not be "
-                       "corrected" % _ARGOCD_APP)
-    if not prune:
-        return False, ("ArgoCD %s spec.syncPolicy.automated.prune is not "
-                       "true — orphaned out-of-band resources (like the "
-                       "planted reverter CronJobs/Deployments) will not "
-                       "be auto-removed on the next reconcile" %
-                       _ARGOCD_APP)
-    return True, ("ArgoCD %s has selfHeal=true AND prune=true" %
-                  _ARGOCD_APP)
-
-
-_GITEA_BASE = "http://gitea.devops.local:3000"
-_GITEA_USER = "root"
-_GITEA_PASS = "Admin@123456"
-_MANIFEST_REPO = "bleater-manifests"
-_MANIFEST_PATH = "templates/infrastructure.yaml"
-
-
-def _a3_source_repo_aligned():
-    """Verify the bleater-redis StatefulSet manifest inside the
-    bleater-manifests Gitea repo (the chart ArgoCD pulls from) has
-    persistence enabled. Setup.sh corrupts this file to --appendonly no
-    + empty volumeClaimTemplates; a correct fix must commit a restored
-    manifest back to master, otherwise ArgoCD selfHeal will reconcile
-    the cluster back to the broken shape on the next refresh.
-
-    Two binary conditions all required (read from the file in master,
-    not the live cluster):
-      1. The redis container's command/args has --appendonly yes AND
-         does NOT have --appendonly no or --save "".
-      2. spec.volumeClaimTemplates contains an entry named 'data'
-         (no entry == emptyDir == ephemeral cache).
-
-    Uses HTTP Basic auth against the Gitea contents API. The file
-    response shape is {"sha": "...", "content": "<base64>", ...}.
-
-    Returns (ok, detail)."""
-    import base64
-    cmd = ["curl", "-s", "--connect-timeout", "5", "--max-time", "20",
-           "-u", "%s:%s" % (_GITEA_USER, _GITEA_PASS),
-           "%s/api/v1/repos/%s/%s/contents/%s" % (
-               _GITEA_BASE, _GITEA_USER, _MANIFEST_REPO, _MANIFEST_PATH)]
-    rc, out, _ = run(cmd, timeout=30)
-    if rc != 0 or not out:
-        return False, ("could not fetch %s from %s/%s via Gitea API (rc=%s)" %
-                       (_MANIFEST_PATH, _GITEA_USER, _MANIFEST_REPO, rc))
-    try:
-        resp = json.loads(out)
-    except Exception:
-        return False, ("Gitea API returned non-JSON for %s" % _MANIFEST_PATH)
-    content_b64 = resp.get("content", "")
-    if not content_b64:
-        return False, ("Gitea API response missing 'content' for %s "
-                       "(repo or path may not exist)" % _MANIFEST_PATH)
-    try:
-        text = base64.b64decode(content_b64).decode("utf-8", "replace")
-    except Exception:
-        return False, ("templates/infrastructure.yaml content_base64 "
-                       "could not be decoded")
-    try:
-        import yaml
-    except Exception:
-        return False, "yaml module unavailable in grader environment"
-    try:
-        docs = list(yaml.safe_load_all(text))
-    except Exception as e:
-        return False, ("%s in git is not valid YAML: %s" %
-                       (_MANIFEST_PATH, e))
-    sts = None
-    for doc in docs:
-        if not isinstance(doc, dict):
-            continue
-        if (doc.get("kind") == "StatefulSet"
-                and (doc.get("metadata") or {}).get("name") == "bleater-redis"):
-            sts = doc
-            break
-    if sts is None:
-        return False, ("%s in git has no StatefulSet named bleater-redis "
-                       "(file may have been deleted or renamed)" % _MANIFEST_PATH)
-    spec = sts.get("spec") or {}
-    containers = (((spec.get("template") or {}).get("spec") or {})
-                  .get("containers") or [])
-    redis_c = next((c for c in containers if c.get("name") == "redis"), None)
-    if redis_c is None:
-        return False, ("bleater-redis StatefulSet in git has no container "
-                       "named 'redis'")
-    cmd_args = ((redis_c.get("command") or []) +
-                (redis_c.get("args") or []))
-    # List-position check: redis-server CLI uses positional pairs like
-    # ['--save', ''] and ['--appendonly', 'no'] / ['--appendonly', 'yes'].
-    # Joining-and-regex misses the empty-string case because the quotes
-    # are YAML-level (the parser strips them). Scan pairs instead.
-    #
-    # YAML 1.1 boolean coercion: an UNQUOTED `yes` in the source YAML
-    # parses to Python True, and `no` parses to False. The chart may
-    # write either quoted strings or unquoted booleans. Normalize:
-    # accept "yes"/"on"/"true"/True as enabled, "no"/"off"/"false"/False
-    # as disabled. Same for save="" (empty string vs Python None).
-    _ENABLED = {"yes", "on", "true"}
-    _DISABLED = {"no", "off", "false"}
-    appendonly_value = None
-    appendonly_present = False
-    save_value = None
-    save_present = False
-    for i, arg in enumerate(cmd_args):
-        token = str(arg).strip().lower()
-        if token == "--appendonly" and i + 1 < len(cmd_args):
-            appendonly_present = True
-            raw = cmd_args[i + 1]
-            if isinstance(raw, bool):
-                appendonly_value = "yes" if raw else "no"
-            else:
-                appendonly_value = str(raw).strip().lower()
-                if appendonly_value in _ENABLED:
-                    appendonly_value = "yes"
-                elif appendonly_value in _DISABLED:
-                    appendonly_value = "no"
-        elif token == "--save" and i + 1 < len(cmd_args):
-            save_present = True
-            raw = cmd_args[i + 1]
-            save_value = "" if raw is None else str(raw).strip()
-    if appendonly_value == "no":
-        return False, ("bleater-redis StatefulSet in git still has "
-                       "--appendonly no — live cluster will regress "
-                       "to no-AOF on next ArgoCD reconcile (command=%r)"
-                       % cmd_args)
-    if save_present and save_value in ("", '""', "''"):
-        return False, ("bleater-redis StatefulSet in git still has "
-                       "--save \"\" — RDB snapshots disabled at the "
-                       "source (command=%r)" % cmd_args)
-    if not appendonly_present or appendonly_value != "yes":
-        return False, ("bleater-redis StatefulSet in git command does "
-                       "not enable --appendonly yes (saw appendonly=%r, "
-                       "command=%r)" % (appendonly_value, cmd_args))
-    vcts = spec.get("volumeClaimTemplates") or []
-    data_pvc = next((v for v in vcts
-                     if (v.get("metadata") or {}).get("name") == "data"),
-                    None)
-    if data_pvc is None:
-        return False, ("bleater-redis StatefulSet in git has no "
-                       "volumeClaimTemplate named 'data' — emptyDir "
-                       "leaves the cache ephemeral across pod restarts")
-    return True, ("bleater-redis manifest in %s/%s is correct "
-                  "(--appendonly yes + PVC named 'data')" %
-                  (_MANIFEST_REPO, _MANIFEST_PATH))
 
 
 def _prom_query(path, timeout=15):
@@ -911,14 +811,45 @@ def _resolve_route_receiver(policy_root, labels):
     return str(receiver).strip().casefold()
 
 
+def _prometheus_has_active_alertmanager(timeout=15):
+    """Return the list of active Alertmanagers Prometheus is currently
+    wired to (via /api/v1/alertmanagers -> data.activeAlertmanagers).
+    Empty list means a Prometheus alerting rule has nowhere to send
+    notifications — it can fire but cannot page anyone."""
+    data, _ = _prom_query("/api/v1/alertmanagers", timeout=timeout)
+    if not data:
+        return []
+    return (data.get("data") or {}).get("activeAlertmanagers") or []
+
+
 def _b3_route_is_pageable(rule, source):
     """Check that the matched alert rule's notification path terminates at
-    a non-blackhole receiver. For Prometheus-store rules this snapshot has
-    no Alertmanager wired, so the check fails open (returns True). For
-    Grafana-store rules (file or runtime API), walk the Grafana
-    notification-policy tree."""
+    a receiver that can actually page someone.
+
+    For Prometheus-store rules, routing happens through Alertmanager. This
+    snapshot ships with the `alertmanagers:` stanza commented out, so a
+    Prometheus rule fires into a void — nobody is notified. Previously this
+    branch failed OPEN (auto-passed), which let an unroutable alert earn the
+    same "routes to pageable receiver" credit that a working-but-blackholed
+    Grafana rule was denied. Now we fail CLOSED unless Prometheus reports at
+    least one active Alertmanager: if an agent genuinely wires one up, the
+    rule passes; otherwise it correctly fails because the alert cannot
+    notify anyone. (The b1 metric whitelist is unchanged — Prometheus rules
+    still satisfy b1/b2; only the routing leg requires a reachable target.)
+
+    For Grafana-store rules (file or runtime API), walk the Grafana
+    notification-policy tree and reject blackhole-shaped receivers."""
     if source == "prometheus":
-        return True, "alertmanager not deployed on this snapshot; route check skipped"
+        active = _prometheus_has_active_alertmanager()
+        if active:
+            urls = [a.get("url") for a in active if isinstance(a, dict)]
+            return True, ("prometheus rule routes to %d active alertmanager(s): "
+                          "%s" % (len(active), urls))
+        return False, ("prometheus-store rule but no Alertmanager is wired to "
+                       "this Prometheus (activeAlertmanagers is empty) — the "
+                       "alert can fire but cannot notify anyone; route it "
+                       "through a store with a reachable receiver (e.g. a "
+                       "Grafana rule with a non-blackhole notification policy)")
     policy = _read_grafana_notification_policies()
     if not policy:
         return False, ("could not read Grafana notification policies "
@@ -1341,7 +1272,9 @@ def subscore_b_alert_observability():
                                                   rule's labels resolve to a
                                                   non-blackhole receiver.
                                                   Prometheus-store rules fail
-                                                  open (no Alertmanager).
+                                                  closed unless a live
+                                                  Alertmanager is wired
+                                                  (none on this snapshot).
     b2/b3 cascade to "no rule to test" when b1 fails.
 
     v43 added b4 (for-duration) and b5 (severity-label) as quality gates,

@@ -265,13 +265,12 @@ while [ $WAIT -lt 90 ]; do
 done
 echo "[solution] Grafana alert rule loaded: ${RULES_LOADED}"
 
-# Belt-and-braces: ensure Grafana's notification policy default receiver
-# isn't a blackhole. v30 grader b3 walks /api/v1/provisioning/policies and
-# fails if the matched receiver silently swallows alerts. For the
-# Prometheus-path oracle b3 fails-open (no Alertmanager wired), but if the
-# cluster ships with a blackhole default we set it to the first non-
-# blackhole receiver we can find — discovered live to avoid hardcoding
-# a name the cluster might rename.
+# Ensure Grafana's notification policy default receiver isn't a blackhole.
+# This oracle's alert lives in the Grafana runtime store, so grader b3 walks
+# /api/v1/provisioning/policies and fails if the matched receiver silently
+# swallows alerts. We set the root receiver to the first non-blackhole
+# receiver we can find — discovered live to avoid hardcoding a name the
+# cluster might rename.
 echo "[solution] Setting Grafana notification policy to a non-blackhole receiver..."
 GRAFANA_AUTH=""
 for pwd in admin123 admin; do
@@ -327,7 +326,7 @@ except Exception:
     echo "[solution] No non-blackhole receiver found in /api/v1/provisioning/contact-points"
   fi
 else
-  echo "[solution] Grafana not reachable; skipping notification-policy fix (b3 fails-open for Prometheus path anyway)"
+  echo "[solution] WARNING: Grafana not reachable; could not set a non-blackhole notification policy (b3 will fail if the default receiver is a blackhole)"
 fi
 
 echo "[solution] Closing the P1 incident with an RCA comment..."
@@ -367,101 +366,5 @@ except Exception: pass
       "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-app/issues/${ISSUE_NUM}" || true
   fi
 fi
-
-echo "[solution] Fixing the bleater-redis manifest in bleater-manifests (source of truth)..."
-# Restore the pre-corruption content by fetching it from Gitea's commit
-# history (the previous commit on this file, before setup.sh's corruption).
-# This avoids any agent-readable scratch file: solution.sh derives the
-# original content via the same Gitea API the agent has access to, but
-# solution.sh itself is task-private so its restoration logic is not
-# exposed as a lookup shortcut.
-SOLUTION_TOKEN_RESP=$(curl -s -u "${GITEA_USER}:${GITEA_PASS}" \
-  --connect-timeout 5 --max-time 15 \
-  -H "Content-Type: application/json" \
-  -d '{"name":"solution-manifest-'"$RANDOM"'","scopes":["write:repository"]}' \
-  "${GITEA_URL}/api/v1/users/${GITEA_USER}/tokens" 2>/dev/null || true)
-SOLUTION_TOKEN=$(echo "$SOLUTION_TOKEN_RESP" | grep -o '"sha1":"[^"]*"' | head -n1 | cut -d'"' -f4)
-
-if [ -n "$SOLUTION_TOKEN" ]; then
-  # Find the sha of the commit BEFORE setup.sh's corruption commit.
-  # Gitea's commits API returns latest-first, so commits[1] is the
-  # pre-corruption state (commits[0] is setup.sh's corruption).
-  COMMITS_JSON=$(curl -s -H "Authorization: token ${SOLUTION_TOKEN}" \
-    --connect-timeout 5 --max-time 15 \
-    "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-manifests/commits?path=templates/infrastructure.yaml&limit=5")
-  PREV_SHA=$(echo "$COMMITS_JSON" | python3 -c "
-import json, sys
-try:
-    commits = json.load(sys.stdin)
-    if isinstance(commits, list) and len(commits) >= 2:
-        print(commits[1].get('sha', ''))
-except Exception:
-    pass" 2>/dev/null)
-
-  # Fetch the file content at the pre-corruption sha
-  ORIGINAL_CONTENT_B64=""
-  if [ -n "$PREV_SHA" ]; then
-    PREV_FILE_RESP=$(curl -s -H "Authorization: token ${SOLUTION_TOKEN}" \
-      --connect-timeout 5 --max-time 15 \
-      "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-manifests/contents/templates/infrastructure.yaml?ref=${PREV_SHA}")
-    ORIGINAL_CONTENT_B64=$(echo "$PREV_FILE_RESP" | python3 -c "
-import json, sys
-try:
-    d = json.load(sys.stdin)
-    print((d.get('content', '') or '').replace(chr(10), ''))
-except Exception:
-    pass" 2>/dev/null)
-  fi
-
-  # Get the CURRENT sha (after setup.sh's corruption) for the PUT payload
-  CURRENT_FILE_RESP=$(curl -s -H "Authorization: token ${SOLUTION_TOKEN}" \
-    --connect-timeout 5 --max-time 15 \
-    "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-manifests/contents/templates/infrastructure.yaml")
-  CURRENT_SHA=$(echo "$CURRENT_FILE_RESP" | python3 -c "
-import json, sys
-try:
-    print(json.load(sys.stdin).get('sha', ''))
-except Exception:
-    pass" 2>/dev/null)
-
-  if [ -n "$CURRENT_SHA" ] && [ -n "$ORIGINAL_CONTENT_B64" ]; then
-    PUT_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'sha': '${CURRENT_SHA}',
-    'content': '${ORIGINAL_CONTENT_B64}',
-    'message': 'revert: restore bleater-redis persistence (rollback platform-perf change)',
-}))
-")
-    PUT_HTTP=$(curl -s -o /tmp/solution-manifest-resp -w "%{http_code}" \
-      --connect-timeout 5 --max-time 30 \
-      -X PUT -H "Authorization: token ${SOLUTION_TOKEN}" \
-      -H "Content-Type: application/json" \
-      -d "$PUT_PAYLOAD" \
-      "${GITEA_URL}/api/v1/repos/${GITEA_USER}/bleater-manifests/contents/templates/infrastructure.yaml")
-    echo "[solution] bleater-manifests restored from previous commit ${PREV_SHA:0:7} (HTTP ${PUT_HTTP})"
-  else
-    echo "[solution] WARN: missing sha or content (current='${CURRENT_SHA}', prev='${PREV_SHA}', bytes=${#ORIGINAL_CONTENT_B64})"
-  fi
-else
-  echo "[solution] WARN: no Gitea token"
-fi
-
-
-echo "[solution] Restoring ArgoCD auto-sync on bleater-platform..."
-# Re-enable automated sync (selfHeal + prune). Live cluster already matches
-# the chart's persistent-redis shape after the kubectl apply above. ArgoCD
-# may still report status.sync.status as OutOfSync due to the well-known
-# StatefulSet vct immutability issue (ArgoCD cannot patch immutable fields,
-# and its `Replace=true` syncOption uses kubectl replace without --force,
-# which hits the same wall) — but the grader's a2 check now verifies only
-# selfHeal+prune (the agent's actual action), not Synced convergence.
-kubectl -n argocd patch application bleater-platform --type=merge \
-  -p='{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}' \
-  >/dev/null 2>&1 || true
-# Nudge a refresh so the status field updates promptly.
-kubectl -n argocd annotate application bleater-platform \
-  argocd.argoproj.io/refresh=normal --overwrite >/dev/null 2>&1 || true
-
 
 echo "[solution] Done."
