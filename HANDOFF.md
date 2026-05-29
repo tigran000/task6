@@ -1,147 +1,212 @@
 # HANDOFF — redis-persistence-drift
 
-**Last updated:** 2026-05-27 (post-v60 push, Dockerfile network ops bounded with timeouts)
+**Last updated:** 2026-05-29 (post-v62 push: subscore A re-coupled to the
+incident + b3 fail-closed for Prometheus rules, in response to a QA review of
+v61).
 
 ## TL;DR
 
-45 versions in. v44 batch landed mean **0.60** (kill-criterion triggered:
-v41=v42=v44=0.60 across three different A-side experiments). v45
-implements Option 1 from the v44 decision: a new `a3
-source_repo_aligned` atom that audits the bleater-redis manifest in
-the bleater-manifests Gitea repo (the source ArgoCD pulls from).
-Setup.sh corrupts the manifest in master via the Gitea contents API;
-agents who only fix the live cluster fail a3 because ArgoCD selfHeal
-would regress the cluster on the next reconcile. Projected mean
-**~0.42** (a1=0.60 × a2=1.0 × a3=~0.40 ≈ 0.24 for A; B unchanged
-~0.60). Awaiting v45 rollout data.
+v62 is the current live version. It fixes two grader defects a QA pass found
+in **v61** (problem version `df78eb4d`), where the whole of subscore A had
+collapsed to a single reverter-audit atom (`a1`) and was awarding full credit
+on a platform that was never actually fixed:
+
+1. **(error) A scored 1.0 on an unfixed/deleted platform.** `a1` only scans
+   for reverter-*shaped* containers. The real breakage —
+   `redis-server --save "" --appendonly no --dir /tmp` on an emptyDir with no
+   PVC — is the main container's *startup command*, not a reverter loop, so
+   `a1` passed on a fully-broken cluster. Deleting workloads outright also
+   passed because `_resource_containers` returned `"absent"` → PASS. QA
+   reproduced 1.0 with Redis still ephemeral, and again with bleat-service /
+   timeline-service deleted.
+2. **(warning) b3 auto-passed Prometheus-store rules.** `_b3_route_is_pageable`
+   returned `True` immediately for `source == "prometheus"` ("route check
+   skipped"), so an alert that can notify nobody (no Alertmanager on this
+   snapshot) got the same credit a working-but-blackholed Grafana rule was
+   denied.
+
+**v62 fix:** subscore A is now a 2-atom AND-gate (`a1` + a positive
+`a2 redis_persistence_restored`), `a1` treats deletion of a *required*
+workload as FAIL, and `b3` fails closed for Prometheus rules unless a live
+Alertmanager is wired. The oracle still scores 1.0 (it restores persistence
+and uses a Grafana rule with a non-blackhole receiver). **Not yet
+eval-validated** — awaiting a v62 batch.
 
 ## Where things stand
 
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** v60 (pushed 2026-05-27, Dockerfile RUN step wrapped in `timeout` + curl `--connect-timeout` flags; VM `.horizon/stash/` cleared)
-- **VM:** `tigranharutyunyan59@34.186.153.63`, files at `~/task/`
-- **Local repo:** `/Users/tigran/task6`, GitHub `tigran000/task6`, master branch
-- **Runtime:** biggie-max-nebula, strict `0 < X < 0.50` ceiling
+- **Current version:** **v62** (pushed 2026-05-29). Local commit `239c9b1`.
+- **VM:** `tigranharutyunyan59@34.186.153.63`, task files at
+  **`~/tasks/redis-persistence-drift/`** (NOT `~/task/` — the old HANDOFF was
+  wrong and it cost a session's worth of confusion). horizon CLI lives at
+  `~/horizon_env/bin/horizon` on the VM.
+- **Local repo:** **`/Users/tigran/tasks/task6`** (the old HANDOFF said
+  `/Users/tigran/task6` — also wrong). GitHub `tigran000/task6`, master branch.
+  Task files under `tasks/redis-persistence-drift/`.
+- **Runtime:** biggie-max-nebula, strict `0 < X < 0.50` ceiling.
 
-## Current grader structure (v45)
+## Current grader structure (v62)
 
-- **A persistence_durability** (1/2): AND-gate of
-  - `a1 no_reverter_sidecar_in_bleat_service` — behavior-based spec audit
-    across 6 reverter resource locations
-  - `a2 argocd_application_synced` — `selfHeal=true AND prune=true AND
-    status.sync.status=Synced`
-  - `a3 source_repo_aligned` — bleater-redis sts manifest in
-    bleater-manifests `templates/infrastructure.yaml` has
-    `--appendonly yes` AND non-empty `volumeClaimTemplates` named
-    `data`. Setup.sh corrupts via Gitea contents API; solution.sh
-    restores via the same API before re-enabling ArgoCD auto-sync.
-- **B alert_observability** (1/2): AND-gate of
-  - `b1 alert_rule_loaded` — three-store discovery
-  - `b2 alert_fires_on_synthetic_failure` — behavioral injection +
-    state-transition under cluster isolation
-  - `b3 alert_routes_to_pageable_receiver` — Grafana policy-tree walk
+Two equal-weight (1/2 each) binary subscores. `grade()` runs A first, then B.
 
-## Key empirical findings (v37–v44)
+- **A persistence_durability** — AND-gate of 2 atoms:
+  - `a1 no_reverter_sidecar_in_bleat_service` — behavior-based spec audit over
+    6 resources (`_REVERTER_SIDECAR_RESOURCES`, now 4-tuples carrying a
+    `classification`). Each container's command/args is matched against
+    reverter-shaped patterns (redis-cli CONFIG SET disabling persistence;
+    kubectl-patch loops). **Resources are classified `"required"` vs
+    `"reverter"`:** deleting a `required` workload (bleat-service,
+    timeline-service, the redis sts) is now a FAIL (`deleted_required`);
+    deleting a `reverter` CronJob is still PASS.
+  - `a2 redis_persistence_restored` — **positive** check on the live
+    bleater-redis sts: redis container command has `--appendonly yes` (not
+    `no`), a non-empty `--save`, AND a `volumeClaimTemplate` named `data`.
+    This is the atom that re-couples A to the actual incident. Measured
+    against the agent's left-behind state (A runs before B's isolation
+    harness).
+- **B alert_observability** — AND-gate of 3 atoms:
+  - `b1 alert_rule_loaded` — three-store discovery (Prometheus
+    `/api/v1/rules`, Grafana file-provisioning CM, Grafana runtime API).
+    Metric whitelist `_b_metric_pattern` (redis_aof_enabled,
+    rdb_changes_since_last_save, rdb_last_bgsave_status, aof_last_write_status).
+  - `b2 alert_fires_on_synthetic_failure` — behavioral. Inside the isolation
+    harness (suspend reverter CronJobs, scale bleat-service to 0, strip sts
+    sidecars, patch sts to known-good), inject a failure and assert state
+    transition. **This is the only durable variance lever** (see findings).
+  - `b3 alert_routes_to_pageable_receiver` — Grafana policy-tree walk for a
+    non-blackhole receiver. **Prometheus-store rules now fail CLOSED** unless
+    Prometheus reports an active Alertmanager
+    (`_prometheus_has_active_alertmanager` via `/api/v1/alertmanagers`); this
+    snapshot wires none.
 
-- **b2 is the only durable variance lever.** 15-version track record
-  of varying 2/5 to 5/5. PromQL composition (label filters, threshold
-  ops against filtered scalars, noDataState) is genuinely error-prone.
+The prior `a2 argocd_application_synced` and `a3 source_repo_aligned` atoms
+(and setup.sh's Gitea manifest-corruption block) were **removed** as confirmed
+dead weight — do not resurrect them without new data.
+
+## Oracle (solution.sh) — how it earns 1.0
+
+1. Deletes reverter CronJobs (+ RBAC) and strips the two in-deploy sidecars.
+2. Rebuilds the redis sts: command
+   `--save "3600 1 300 100 60 10000" --appendonly yes --appendfsync everysec
+   --dir /data` + a `data` vct (RWO 2Gi). Uses scale-0 → delete → apply
+   (vct is immutable). → passes `a1` + `a2`.
+3. Creates a **Grafana** runtime alert rule on `redis_aof_enabled` (datasource
+   uid `prometheus`, threshold refId `C`) and sets the notification policy
+   root receiver to a non-blackhole contact point. → passes `b1`/`b2`/`b3`
+   via the Grafana path (so the b3 Prometheus fail-closed change does not
+   touch the oracle).
+
+## Key empirical findings (still valid)
+
+- **b2 is the only durable variance lever.** Long track record of varying
+  2/5–5/5. PromQL composition (label filters, threshold ops against filtered
+  scalars, noDataState) is genuinely error-prone.
 - **Every config-presence atom saturates within 1–2 versions.**
   `baseline_survives_restart`, `no_orphan_watchdog_rbac`, `alert_rule_loaded`
-  (post-v32), v44 `prune=true AND selfHeal=true` — all DEAD@1.
-- **Behavioral atoms that don't have a real skill axis saturate too.**
-  `data_survives_pod_restart` went DEAD@1 because agents rebuild sts
-  wholesale (dropping initContainer as side effect). v42 behavioral
-  drift-injection on a2 caught 0/5 — it was downstream of the same
-  precondition as the spec check.
-- **A-side has no remaining variance lever.** Without source-side
-  breakage (setup.sh modifying the Gitea manifest repo), every
-  ArgoCD-shaped check on the live cluster saturates.
+  (post-v32), `prune=true AND selfHeal=true` (v44) — all went DEAD@1. This is
+  why `a2_argocd`/`a3` were dropped. **Watch `a2 redis_persistence_restored`
+  for the same fate** — it is a spec-presence check; if v62 data shows it
+  5/5, it adds no variance and the real signal is still b2.
+- **Behavioral atoms without a real skill axis saturate too.**
+  `data_survives_pod_restart` went DEAD@1 (agents rebuild the sts wholesale,
+  dropping any planted initContainer as a side effect). A v42 behavioral
+  drift-injection on a2 caught 0/5 (downstream of the same precondition as the
+  spec check).
+- **A-side has historically had no durable variance lever.** Spec/ArgoCD-shaped
+  checks on the live cluster all saturate. The v62 `a2` is a *correctness*
+  guard (closes the false-positive QA found), not necessarily a variance
+  source — its job is to stop A rewarding a broken cluster, not to vary.
 
-## v37–v45 trajectory (compressed)
+## Version trajectory (compressed)
 
-| v | A_atoms | B_atoms | Mean | Outcome |
-|---|---|---|---|---|
-| v37 | a1+a2_data_survives | b1+b2+b3 | 0.40 | sample-variance in-band |
-| v38 | a1+a2 | b1+b2+b3 + range-op fix | 0.70 | calibration removal saturated b1 |
-| v39 | a1+a2 / c1 (3-subscore) | b1+b2+b3 | 0.73 | c1 (ArgoCD config) DEAD@1 at 9/10 |
-| v40 | a1 only | b1+b2+b3 | not batched | dropped DEAD@1 a2, softened P1 body |
-| v41 | a1+a2_argocd | b1+b2+b3 | 0.60 | collapsed C into A |
-| v42 | a1+a2_drift_behavioral | b1+b2+b3 | 0.60 | behavioral drift caught 0/5 |
-| v43 | a1+a2 | b1+b2+b3+b4_for+b5_severity | not batched | preempted as redundant |
-| v44 | a1+a2_prune_strict | b1+b2+b3 | 0.60 | prune-tightening caught 0/5 |
-| v45 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | solution.sh scored 0.5 locally — a2 OutOfSync due to git/live vct shape mismatch |
-| v46 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | solution.sh STILL 0.5 — a2 OutOfSync. vct-shape guess was wrong root cause |
-| v47 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | a2 still OutOfSync. Diagnostic revealed REAL root cause: CSA→SSA migration fails on immutable vct. v44 only "passed" a2 via stale status (no sync was triggered) |
-| v48 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | a2 still OutOfSync. Diagnostic revealed: ArgoCD created sts from corrupted git in 30s window before our restore; then update path hit immutable vct |
-| v49 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | Aggressive delete + Replace=true + force=true + retrigger loop. Same OutOfSync — race persists; sts delete still happens before git restore |
-| v50 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | a2 still OutOfSync. Full diagnostic showed: "Retrying attempt #5" of vct immutable update. ignoreDifferences only affects diff visibility, not apply behavior |
-| v51 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | No-Op validation failed at SETUP. Setup.sh's `op:remove /spec/syncPolicy/automated` silently failed when path absent; Argo auto-sync stayed on; Argo recreated sts during setup's delete-then-apply window |
-| v52 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | Setup.sh now succeeds (hardening worked) but a2 OutOfSync persisted. Diagnostic confirmed `Replace=true` IS in effect ("error when replacing /dev/shm/...") but kubectl replace ≠ kubectl replace --force; immutable error continues |
-| v53 | a1+a2+a3_source_repo | b1+b2+b3 | invalid | a2 still OutOfSync (RespectIgnoreDifferences likely not supported in this Argo version) AND b2 newly broke (SSA pre-apply with argocd-controller manager conflicted with grader's default-manager patches). Score 0.0 |
-| v54 | a1+a2(no-Synced)+a3 | b1+b2+b3 | 0.50 mean | 5 rollouts. a3 5/5 (saturated), b3 dropped to 2/5 (new variance). Score distribution `0,0.5,0.5,0.5,1.0` |
-| v55 | a1+a2(no-Synced)+a3 | b1+b2+b3 | pending | Closed reviewer-flagged answer-leak: `/tmp/bleater-manifests-original.b64`. solution.sh now restores via Gitea commits API (fetches previous-commit content). |
-| v56 | a1+a2(no-Synced)+a3 | b1+b2+b3 | n/a | VM cleanup only: deleted stale `~/task/redis-persistence-drift/` subfolder that was getting pushed with every version. |
-| v57 | a1+a2(no-Synced)+a3 | b1+b2+b3 | invalid | Validator failed at Dockerfile build: `GET https://index.docker.io/v2/bitnami/kubectl/manifests/1.28:` — Bitnami deprecated free docker.io images in 2024, the `bitnami/kubectl:1.28` tag is no longer pullable. Confirms why v55's runtime pull silently failed too. |
-| v58 | a1+a2(no-Synced)+a3 | b1+b2+b3 | invalid | Parallel push (hardened setup.sh: removed runtime-pull fallback, made image-import failure LOUD) but still referenced the dead `bitnami/kubectl:1.28` |
-| v59 | a1+a2(no-Synced)+a3 | b1+b2+b3 | invalid (timeout) | No-op validation hit the 90-min timeout sweep. Root cause: Dockerfile RUN had uncapped `curl` + `crane pull` — either could hang indefinitely on slow/flaky network instead of fail-fast. |
-| v60 | a1+a2(no-Synced)+a3 | b1+b2+b3 | pending | Bounded the Dockerfile network ops: `timeout 120 curl --connect-timeout 10 --max-time 90 --retry 2` for crane download, `timeout 300 crane pull` for image pull. If either hangs, build fails within minutes with a clear error. Also: cleaned `.horizon/stash/` on VM. |
+| v   | A_atoms                      | Mean / status     | Outcome |
+| --- | ---------------------------- | ----------------- | ------- |
+| v44 | a1 + a2_prune_strict         | 0.60              | prune-tightening caught 0/5; A too easy |
+| v45–v53 | a1 + a2 + a3_source_repo | invalid           | a3 (Gitea-manifest GitOps lever) — oracle stuck at 0.5 / 0.0 across 9 versions chasing ArgoCD OutOfSync (immutable-vct CSA→SSA, setup races, RespectIgnoreDifferences unsupported). Abandoned. |
+| v54 | a1 + a2(no-Synced) + a3      | 0.50              | a3 saturated 5/5; b3 dropped to 2/5 (new variance). Dist `0,0.5,0.5,0.5,1.0` |
+| v55 | a1 + a2(no-Synced) + a3      | pending           | closed answer-leak `/tmp/bleater-manifests-original.b64`; solution.sh restores via Gitea commits API |
+| v56 | a1 + a2(no-Synced) + a3      | n/a               | VM cleanup (stale subfolder) |
+| v57–v60 | a1 + a2(no-Synced) + a3  | invalid           | Dockerfile build/timeout fights: dead `bitnami/kubectl:1.28` (Bitnami deprecated free docker.io images), then uncapped curl/crane hangs. v60 bounded all network ops with `timeout`. |
+| **v61** | **a1 only (single atom)** | (QA-reviewed)   | A collapsed to single reverter-audit atom; a2_argocd/a3 dropped as dead weight. **QA found A awards 1.0 on an unfixed/deleted platform** (problem version `df78eb4d`) + b3 auto-passes Prometheus rules. |
+| **v62** | **a1 + a2_redis_persistence_restored** | pushed 2026-05-29, **not yet batched** | re-coupled A to the incident (positive persistence check + deletion-of-required = FAIL); b3 fail-closed for Prometheus rules. Oracle = 1.0. |
 
-## v44 per-item (most recent batched data)
+## What to watch on the v62 batch
 
-| Item | Pass | Pattern | Notes |
-|---|---|---|---|
-| a1 no_reverter_sidecar | 3/5 | `++xx+` | runs 3,4 missed in-deploy sidecars (cache-config-tuner, redis-pool-sizer) |
-| a2 argocd_synced | 5/5 | `+++++` | DEAD@1 — all 5 set prune+selfHeal |
-| b1 alert_rule_loaded | 5/5 | `+++++` | DEAD@1 — mostly Grafana, some Prometheus |
-| b2 alert_fires | 4/5 | `+++x+` | run3 used label filter that returned empty vector |
-| b3 routes_pageable | 4/5 | `++++x` | run5 hit pre-existing blackhole receiver |
+- **Mean band:** A may now genuinely fail for agents who suppress reverters but
+  leave Redis ephemeral, and b3 now fails Prometheus-only alerts → both push
+  the mean *down* from v61. If mean < ~0.20, soften (e.g. drop the `--save`
+  sub-condition in `a2`, or accept Prometheus rules in b3). If `a2` is 5/5 it's
+  saturated-but-harmless (it's a correctness guard, not the variance source).
+- **b3 fairness:** confirm agents *can* discover that a Prometheus rule can't
+  page on this snapshot (no Alertmanager). The P1 issue's "no alerting on this
+  layer … got blindsided" + "land somewhere they will stick" is the
+  symptom-level pointer. If 0/N agents use Grafana, the hint may be too oblique
+  → consider a clearer nudge rather than reverting b3.
+- Pull ≥10 rollouts (2 batches) before reacting to any single 0/5 on an
+  AND-gated atom — sample variance is ±2/5.
 
-## v45 hypothesis
+## Workflow conventions (durable)
 
-`a3 source_repo_aligned` adds a new variance lever that the v44 data
-shows has not been exhausted. Setup.sh now PUTs a corrupted
-templates/infrastructure.yaml to bleater-manifests master (Gitea
-contents API). With ArgoCD auto-sync still disabled by setup.sh,
-the corruption sits dormant until an agent re-enables Argo.
-Agents who only fix the live cluster pass a1/a2 but fail a3 — the
-P1 hint "make sure your changes land somewhere they will stick" is
-the symptom-level pointer for this distinction.
-
-Projected: a1=0.60, a2=1.0, a3=~0.30-0.50 → A joint ≈ 0.24 →
-mean ≈ 0.5×0.24 + 0.5×0.60 = **~0.42** (in band).
-
-Risks: if a3 also saturates at 1.0 (agents reflexively edit git too)
-the mean stays at 0.60. If a3 lands at 0% (too oblique hint), mean
-drops below 0.25 and a1 reverter audit needs softening too.
-
-## Workflow conventions (durable preferences)
-
-- **No local validation** before push (`[[no-local-validation]]` memory).
-  Hosted eval rollouts are the signal.
-- **No eval submissions without explicit user ask.** Pushing a new
-  version is a separate action from submitting a batch.
-- **Git workflow:** per-version commits in `/Users/tigran/task6` (master).
-  Rsync local → push from VM → commit locally.
-- **Per-version sequence:** edit local → `rsync --exclude='.git'
-  --exclude='.horizon' --exclude='.rollouts' --exclude='.validation'
-  local → VM` → `horizon tasks push` → commit locally.
-- **Pull rollouts** with `horizon rollouts pull <uuid>` from `~/task/`
-  on VM, then rsync `.rollouts/` back to local (gitignored).
-- **API keys** in `~/Downloads/core/key-info.md`.
-- **Dead-code cleanup before push** — audit for stale `_a2_*`, `_c1_*`,
-  orphaned constants from removed atoms before every `horizon tasks push`.
+- **VM is authoritative for versions.** Local git history runs *behind* the
+  VM — v55–v61 were pushed from the VM but never committed locally, so the
+  v62 commit (`239c9b1`) jumped local history straight from v60. Always check
+  `~/tasks/redis-persistence-drift/.horizon/metadata.json` on the VM for the
+  real version. The local `.horizon/metadata.json` is stale (`version: 35`)
+  and is gitignored/excluded from rsync — ignore it.
+- **Per-version sequence:** edit local → rsync local → VM → `horizon tasks
+  push` on the VM → commit locally. (key-info.md says commit-after-push; the
+  order isn't load-bearing.)
+- **Exact rsync** (note the `~/tasks/<name>/` path and the excludes —
+  excluding `.horizon` is mandatory so you don't clobber the VM's real version
+  metadata with the stale local one):
+  ```
+  rsync -avz --exclude='.git' --exclude='.horizon' --exclude='.rollouts' \
+    --exclude='.validation' \
+    /Users/tigran/tasks/task6/tasks/redis-persistence-drift/ \
+    tigranharutyunyan59@34.186.153.63:~/tasks/redis-persistence-drift/
+  ```
+  Then `ssh … 'cd ~/tasks/redis-persistence-drift && horizon tasks push'`.
+  Watch for a stray `__pycache__/` getting rsync'd if you ran `py_compile`
+  locally — delete it on both sides.
+- **PERMISSION-CLASSIFIER GOTCHA (this session's main time-sink):** in auto
+  mode, the safety classifier blocks `ssh`/`rsync` to this VM (raw public IP,
+  not a configured git remote → treated as exfiltration of the answer-key
+  files), AND blocks the agent from writing its own allow-rule. A verbal "go
+  ahead" in chat does NOT clear it. To let the agent push directly, the **user
+  must** add to `/Users/tigran/tasks/task6/.claude/settings.local.json`:
+  ```json
+  { "permissions": { "allow": ["Bash(rsync:*)",
+    "Bash(ssh tigranharutyunyan59@34.186.153.63:*)"] } }
+  ```
+  Otherwise the user runs the rsync/push themselves (e.g. `!`-prefixed in the
+  prompt). Don't try to route around the block with scp/`ssh tee` — that's a
+  guardrail bypass.
+- **No eval submissions without explicit user ask.** Pushing a version ≠
+  submitting a batch.
+- **No local validation** before push (hosted rollouts are the signal).
+- **Dead-code cleanup before push** — audit for orphaned `_a2_*`/`_c1_*`
+  helpers + constants from removed atoms. v62 is clean (scripted unused-symbol
+  check passed). Note grader.py docstrings still carry historical version refs
+  ("biggie-max-nebula", "v25/v30/v43", "daydream") — harmless (grader is not
+  copied into the agent image), but the pre-push smell-test in key-info.md
+  greps for them, so don't be alarmed.
+- **Pre-push checks:** `python3 -c "import ast; ast.parse(open('grader.py').read())"`,
+  `bash -n setup.sh solution.sh`, and grep task.yaml/setup.sh (agent-visible)
+  for leak strings.
+- **API keys / VM creds / horizon CLI examples:** `~/Downloads/core/key-info.md`
+  (also mirrored at `/Users/tigran/tasks/core/key-info.md`). This file is the
+  authoritative source for the VM paths — trust it over older HANDOFFs.
 
 ## References cheat-sheet
 
-- `task-hardner.md` — Hardening Decision Tree, U-curve calibration
-- `AGENT_DIFFICULTY_BANK_v2.md` — Pattern 1 (layered self-healing),
-  Anti-pattern #23 (same-shape mechanism diversity), Anti-pattern #27
-  (atoms that the model has reliably internalized)
-- `task-authoring-playbook.md` — Multiplication Trick math table,
-  Hint Disclosure U-curve specifics
-- `Master guide.md` — strict-ceiling rules, AND-gate non-functional rule
-- `nebula-task-reviewer-v3.md` — 7-phase review procedure
-- `nebula-batch-qc-feedback.md` — 20-point QC reformat
+- `key-info.md` — VM creds, exact rsync/horizon commands, DEAD@N triage,
+  subscore-independence checklist, "in band" numbers.
+- `task-hardner.md` — Hardening Decision Tree, U-curve hint calibration.
+- `task-authoring-playbook.md` — 30-item pre-push audit, regex/PromQL traps.
+- `nebula-task-reviewer-v3.md` — 8-phase static review procedure (this is the
+  lens QA used on v61).
+- `nebula-batch-qc-feedback.md` — 20-point batch QC reformat.
+- `AGENT_DIFFICULTY_BANK_v2.md` — difficulty levers, hint-disclosure U-curve.
+- `Master guide.md` — strict-ceiling rules, AND-gate non-functional rule.
