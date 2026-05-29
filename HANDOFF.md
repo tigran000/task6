@@ -1,15 +1,25 @@
 # HANDOFF — redis-persistence-drift
 
-**Last updated:** 2026-05-29 (post-v62 push: subscore A re-coupled to the
-incident + b3 fail-closed for Prometheus rules, in response to a QA review of
-v61).
+**Last updated:** 2026-05-30 (post-v63 push: a2 hardened with --dir /data +
+PVC-Bound checks, closing an ephemeral-data bypass QA found in v62).
 
 ## TL;DR
 
-v62 is the current live version. It fixes two grader defects a QA pass found
-in **v61** (problem version `df78eb4d`), where the whole of subscore A had
-collapsed to a single reverter-audit atom (`a1`) and was awarding full credit
-on a platform that was never actually fixed:
+v63 is the current live version. **v63** closed a follow-up QA finding
+(warning) on v62: `_a2` was still spec-shape only — it checked
+`--appendonly`/`--save`/the `data` VCT but never `--dir`, so an agent who
+flipped the flags in place while leaving the watchdog reverter's `--dir /tmp`
+(`setup.sh:395`) passed `a2` while AOF/RDB wrote to ephemeral `/tmp` (durable
+flags, ephemeral data). It also never confirmed the `data` PVC actually
+Bound. **v63 adds:** `a2` rejects `--dir` ≠ `/data`, and asserts PVC
+`data-bleater-redis-0` is `Bound`. (Deliberately skipped: `availableReplicas`
+on the deployments and functional `CONFIG GET` in A — both rollout-timing
+flaky. Oracle still 1.0.) Local commit `d76a0cb`. Not yet eval-validated.
+
+**v62** (the prior fix) addressed two defects a QA pass found in **v61**
+(problem version `df78eb4d`), where the whole of subscore A had collapsed to a
+single reverter-audit atom (`a1`) and was awarding full credit on a platform
+that was never actually fixed:
 
 1. **(error) A scored 1.0 on an unfixed/deleted platform.** `a1` only scans
    for reverter-*shaped* containers. The real breakage —
@@ -37,7 +47,8 @@ eval-validated** — awaiting a v62 batch.
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** **v62** (pushed 2026-05-29). Local commit `239c9b1`.
+- **Current version:** **v63** (pushed 2026-05-30). Local commit `d76a0cb`
+  (v62 was `239c9b1`).
 - **VM:** `tigranharutyunyan59@34.186.153.63`, task files at
   **`~/tasks/redis-persistence-drift/`** (NOT `~/task/` — the old HANDOFF was
   wrong and it cost a session's worth of confusion). horizon CLI lives at
@@ -62,10 +73,14 @@ Two equal-weight (1/2 each) binary subscores. `grade()` runs A first, then B.
     deleting a `reverter` CronJob is still PASS.
   - `a2 redis_persistence_restored` — **positive** check on the live
     bleater-redis sts: redis container command has `--appendonly yes` (not
-    `no`), a non-empty `--save`, AND a `volumeClaimTemplate` named `data`.
+    `no`), a non-empty `--save`, `--dir` at `/data` (rejects `/tmp` etc.;
+    absent OK since image WORKDIR=/data), a `volumeClaimTemplate` named
+    `data`, AND that PVC `data-bleater-redis-0` is actually `Bound` (v63).
     This is the atom that re-couples A to the actual incident. Measured
     against the agent's left-behind state (A runs before B's isolation
-    harness).
+    harness). NB: still no pod-Ready / availableReplicas check — those were
+    skipped for rollout-timing flakiness; B's harness needing redis up caps
+    a non-startable spec at 0.5.
 - **B alert_observability** — AND-gate of 3 atoms:
   - `b1 alert_rule_loaded` — three-store discovery (Prometheus
     `/api/v1/rules`, Grafana file-provisioning CM, Grafana runtime API).
@@ -130,7 +145,8 @@ dead weight — do not resurrect them without new data.
 | v56 | a1 + a2(no-Synced) + a3      | n/a               | VM cleanup (stale subfolder) |
 | v57–v60 | a1 + a2(no-Synced) + a3  | invalid           | Dockerfile build/timeout fights: dead `bitnami/kubectl:1.28` (Bitnami deprecated free docker.io images), then uncapped curl/crane hangs. v60 bounded all network ops with `timeout`. |
 | **v61** | **a1 only (single atom)** | (QA-reviewed)   | A collapsed to single reverter-audit atom; a2_argocd/a3 dropped as dead weight. **QA found A awards 1.0 on an unfixed/deleted platform** (problem version `df78eb4d`) + b3 auto-passes Prometheus rules. |
-| **v62** | **a1 + a2_redis_persistence_restored** | pushed 2026-05-29, **not yet batched** | re-coupled A to the incident (positive persistence check + deletion-of-required = FAIL); b3 fail-closed for Prometheus rules. Oracle = 1.0. |
+| **v62** | **a1 + a2_redis_persistence_restored** | pushed 2026-05-29 | re-coupled A to the incident (positive persistence check + deletion-of-required = FAIL); b3 fail-closed for Prometheus rules. Oracle = 1.0. QA then found a2 was still spec-shape only (see v63). |
+| **v63** | **a1 + a2 (+ --dir /data + PVC Bound)** | pushed 2026-05-30, **not yet batched** | closed the "durable flags, ephemeral data" bypass: a2 now rejects `--dir`≠/data (watchdog sets `--dir /tmp`) and requires PVC `data-bleater-redis-0` Bound. Oracle = 1.0. |
 
 ## What to watch on the v62 batch
 
