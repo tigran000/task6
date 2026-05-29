@@ -20,14 +20,16 @@ between-subscore checks are independent code paths.
       a2 redis_persistence_restored  (POSITIVE PERSISTENCE CHECK)
          The bleater-redis StatefulSet must be back in a durable shape:
          the redis container command has --appendonly yes (not no), a
-         non-empty --save interval, AND the sts declares a
-         volumeClaimTemplate named 'data' so /data is PVC-backed rather
-         than emptyDir. This closes the gap a1 cannot see: the original
-         breakage (`redis-server --save "" --appendonly no --dir /tmp`)
-         is the main container's startup command, NOT a reverter-shaped
-         loop, so a1 passes on a fully-unfixed cluster. Without a2 the
-         subscore awarded full credit while Redis was still ephemeral —
-         or even while the whole sts/services were deleted.
+         non-empty --save interval, --dir pointing at /data (not /tmp or
+         any ephemeral path), AND a volumeClaimTemplate named 'data' whose
+         PVC (data-bleater-redis-0) is actually Bound. This closes the gap
+         a1 cannot see: the original breakage (`redis-server --save ""
+         --appendonly no --dir /tmp`) is the main container's startup
+         command, NOT a reverter-shaped loop, so a1 passes on a fully-
+         unfixed cluster. The --dir and Bound-PVC checks specifically stop
+         the "durable-shaped flags, ephemeral data" bypass — flipping
+         appendonly/save in place while leaving --dir /tmp, or declaring a
+         'data' VCT whose PVC never provisioned.
 
       Prior a2 (argocd_application_synced) and a3 (source_repo_aligned)
       atoms were dropped as confirmed dead weight (both saturated 5/5 on
@@ -293,12 +295,20 @@ def _a2_redis_persistence_restored():
     _is_reverter_shaped returns False for it and a1 alone passes even
     on an unfixed cluster.
 
-    Three binary conditions all required:
-      1. spec.template.spec.containers[0] command has --appendonly yes
-         (and not --appendonly no).
+    Binary conditions, all required:
+      1. redis container command has --appendonly yes (not --appendonly no).
       2. command's --save value is non-empty (RDB snapshots enabled).
-      3. spec.volumeClaimTemplates contains an entry named 'data' —
-         the /data mount must be PVC-backed, not emptyDir.
+      3. command's --dir, if set, points at /data — NOT /tmp or any other
+         ephemeral path. The redis-config-watchdog reverter sets exactly
+         `--dir /tmp` (setup.sh), so an agent who flips appendonly/save in
+         place but leaves --dir /tmp keeps writing AOF/RDB to ephemeral
+         storage: durable-shaped flags, ephemeral data. Absent --dir is
+         accepted (the redis image's WORKDIR is /data).
+      4. spec.volumeClaimTemplates contains an entry named 'data' AND the
+         backing PVC data-bleater-redis-0 is Bound — the /data mount must be
+         real persistent storage, not an unbound claim or emptyDir. The
+         incident deleted this PVC, so a VCT declaration alone is not proof
+         the volume actually provisioned.
 
     YAML 1.1 boolean coercion: unquoted `yes`/`no` parse to True/False
     in Python — normalize before comparing.
@@ -328,6 +338,7 @@ def _a2_redis_persistence_restored():
     appendonly = None
     save_present = False
     save_value = None
+    dir_value = None
     for i, arg in enumerate(cmd_args):
         token = str(arg).strip().lower()
         if token == "--appendonly" and i + 1 < len(cmd_args):
@@ -342,6 +353,9 @@ def _a2_redis_persistence_restored():
             save_present = True
             raw = cmd_args[i + 1]
             save_value = "" if raw is None else str(raw).strip()
+        elif token == "--dir" and i + 1 < len(cmd_args):
+            raw = cmd_args[i + 1]
+            dir_value = "" if raw is None else str(raw).strip()
     if appendonly == "no":
         return False, ("bleater-redis sts command has --appendonly no — "
                        "AOF disabled, cache wipes on every pod restart "
@@ -353,6 +367,11 @@ def _a2_redis_persistence_restored():
     if save_present and save_value in ("", '""', "''"):
         return False, ("bleater-redis sts command has --save \"\" — RDB "
                        "snapshots disabled (command=%r)" % cmd_args)
+    if dir_value is not None and dir_value.rstrip("/") != "/data":
+        return False, ("bleater-redis sts command writes persistence to "
+                       "--dir %r instead of /data — AOF/RDB land on ephemeral "
+                       "storage and are lost on pod restart (command=%r)"
+                       % (dir_value, cmd_args))
     vcts = spec.get("volumeClaimTemplates") or []
     data_pvc = next((v for v in vcts
                      if (v.get("metadata") or {}).get("name") == "data"),
@@ -361,8 +380,16 @@ def _a2_redis_persistence_restored():
         return False, ("bleater-redis sts has no volumeClaimTemplate "
                        "named 'data' — /data is ephemeral (emptyDir or "
                        "missing)")
+    pvc_phase = kubectl_jsonpath(
+        ["get", "pvc", "data-bleater-redis-0"], "{.status.phase}")
+    if pvc_phase != "Bound":
+        return False, ("bleater-redis 'data' volumeClaimTemplate is declared "
+                       "but its PVC data-bleater-redis-0 is not Bound "
+                       "(phase=%r) — /data has no real persistent volume"
+                       % (pvc_phase or "<absent>"))
     return True, ("bleater-redis sts has --appendonly yes, --save %r, "
-                  "and a 'data' volumeClaimTemplate" % save_value)
+                  "--dir %s, and a Bound 'data' PVC"
+                  % (save_value, dir_value or "/data (default)"))
 
 
 def subscore_a_persistence_durability():
@@ -382,15 +409,17 @@ def subscore_a_persistence_durability():
     a2 redis_persistence_restored           — Positive check that the
                                               bleater-redis sts is back in
                                               a durable shape: --appendonly
-                                              yes, a non-empty --save, and a
-                                              'data' volumeClaimTemplate.
-                                              Catches the core breakage a1
-                                              cannot see — the broken
-                                              `redis-server --save ""
-                                              --appendonly no --dir /tmp`
-                                              startup command is not
-                                              reverter-shaped, so a1 alone
-                                              passes on an unfixed cluster.
+                                              yes, a non-empty --save, --dir
+                                              at /data (not ephemeral), and
+                                              a 'data' volumeClaimTemplate
+                                              whose PVC is Bound. Catches the
+                                              core breakage a1 cannot see —
+                                              the broken `redis-server
+                                              --save "" --appendonly no
+                                              --dir /tmp` startup command is
+                                              not reverter-shaped, so a1
+                                              alone passes on an unfixed
+                                              cluster.
 
     The prior a2 (argocd_application_synced) and a3 (source_repo_aligned)
     atoms were dropped as confirmed dead weight (both saturated 5/5).
