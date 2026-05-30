@@ -47,8 +47,14 @@ eval-validated** — awaiting a v62 batch.
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** **v63** (pushed 2026-05-30). Local commit `d76a0cb`
-  (v62 was `239c9b1`).
+- **Current version:** **v64** (pushed 2026-05-30). Local commit `2287fdb`.
+  Prior: v63 `d76a0cb`, v62 `239c9b1`.
+- **Latest empirical data (daydream, 11 rollouts across v62+v63):** A 6/11
+  (~55%, legitimate sidecar-hunt variance — failures are agents missing the
+  `cache-config-tuner`/`redis-pool-sizer` in-deployment sidecars, confirmed via
+  2/2-container pods in run4/5); B 2/11 (~18%, alive but low — only
+  Grafana+receiver rules pass b3). Mean v62 0.42 / v63 0.30, both in band. v64
+  targets B's low rate via disclosure (grader unchanged).
 - **VM:** `tigranharutyunyan59@34.186.153.63`, task files at
   **`~/tasks/redis-persistence-drift/`** (NOT `~/task/` — the old HANDOFF was
   wrong and it cost a session's worth of confusion). horizon CLI lives at
@@ -146,7 +152,9 @@ dead weight — do not resurrect them without new data.
 | v57–v60 | a1 + a2(no-Synced) + a3  | invalid           | Dockerfile build/timeout fights: dead `bitnami/kubectl:1.28` (Bitnami deprecated free docker.io images), then uncapped curl/crane hangs. v60 bounded all network ops with `timeout`. |
 | **v61** | **a1 only (single atom)** | (QA-reviewed)   | A collapsed to single reverter-audit atom; a2_argocd/a3 dropped as dead weight. **QA found A awards 1.0 on an unfixed/deleted platform** (problem version `df78eb4d`) + b3 auto-passes Prometheus rules. |
 | **v62** | **a1 + a2_redis_persistence_restored** | pushed 2026-05-29 | re-coupled A to the incident (positive persistence check + deletion-of-required = FAIL); b3 fail-closed for Prometheus rules. Oracle = 1.0. QA then found a2 was still spec-shape only (see v63). |
-| **v63** | **a1 + a2 (+ --dir /data + PVC Bound)** | pushed 2026-05-30, **not yet batched** | closed the "durable flags, ephemeral data" bypass: a2 now rejects `--dir`≠/data (watchdog sets `--dir /tmp`) and requires PVC `data-bleater-redis-0` Bound. Oracle = 1.0. |
+| **v63** | **a1 + a2 (+ --dir /data + PVC Bound)** | daydream 5-run: **0.30** (A 3/5, B 0/5) | closed the "durable flags, ephemeral data" bypass: a2 rejects `--dir`≠/data and requires PVC Bound. Oracle = 1.0. B 0/5 was sample noise (see v62). |
+| **v62** (batched) | a1 + a2_redis_persistence_restored | daydream 6-run: **0.42** (A 3/6, B 2/6) | b3 fail-closed first shipped here. B=2/6 proves B is alive (Grafana+receiver passes; Prometheus-only fails). |
+| **v64** | a1 + a2; **P1 issue discloses "alert must page a human"** | pushed 2026-05-30, **not yet batched** | grader UNCHANGED. setup.sh-only: sharpened P1 Notes to disclose (symptom-level) that the alert must reach on-call, closing the b3 under-disclosure that pinned B at ~18%. Target: B → ~40-60%. |
 
 ## What to watch on the v62 batch
 
