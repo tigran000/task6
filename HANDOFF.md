@@ -47,14 +47,27 @@ eval-validated** — awaiting a v62 batch.
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** **v64** (pushed 2026-05-30). Local commit `2287fdb`.
-  Prior: v63 `d76a0cb`, v62 `239c9b1`.
-- **Latest empirical data (daydream, 11 rollouts across v62+v63):** A 6/11
-  (~55%, legitimate sidecar-hunt variance — failures are agents missing the
-  `cache-config-tuner`/`redis-pool-sizer` in-deployment sidecars, confirmed via
-  2/2-container pods in run4/5); B 2/11 (~18%, alive but low — only
-  Grafana+receiver rules pass b3). Mean v62 0.42 / v63 0.30, both in band. v64
-  targets B's low rate via disclosure (grader unchanged).
+- **Current version:** **v65** (pushed 2026-05-30). Local commit `387b891`.
+  Prior: v64 `2287fdb`, v63 `d76a0cb`, v62 `239c9b1`.
+- **MODEL MATTERS — two model regimes seen:**
+  - **daydream** (v62+v63, 11 rollouts): A ~55%, B ~18% (low). Weaker model.
+  - **biggie-max-nebula** (v64, 10 rollouts — the TARGET): A 30%, B 100%.
+    Stronger model — same hint that gave daydream 18% gave biggie 100%. **The
+    hint U-curve is model-specific; calibrate against biggie, not daydream.**
+- **A is the reliable difficulty driver** (30% on biggie, ~55% daydream),
+  legitimate sidecar-hunt variance (agents miss `cache-config-tuner` /
+  `redis-pool-sizer` in-deployment sidecars; confirmed via 2/2-container pods).
+- **B is the volatile one** — swings 18%↔100% on the routing disclosure. b3
+  fail-closed (v62) makes routing mandatory; how much to disclose it is the
+  whole game. v64 over-disclosed (→100%), v65 reverts to oblique.
+- **SECURITY (cross-version, critical):** QA flagged a hostPath sandbox-escape
+  (`kubectl label ns monitoring enforce=privileged` → hostPath pod reads
+  `/host/mcp_server/.../solution.sh` + grader + kubeconfig). Root cause is the
+  base image's `protect-pss-labels` VAP exempting monitoring/gitea + the
+  ubuntu-user wildcard RBAC — **harness-level, not the grader**, affects every
+  version. Task-side partial: drop `gitea` from `ALLOWED_NAMESPACES` (Dockerfile;
+  the task only uses Gitea over HTTP, never kubectl -n gitea). `monitoring` must
+  stay (B needs it) so the full fix needs the platform team. Not yet actioned.
 - **VM:** `tigranharutyunyan59@34.186.153.63`, task files at
   **`~/tasks/redis-persistence-drift/`** (NOT `~/task/` — the old HANDOFF was
   wrong and it cost a session's worth of confusion). horizon CLI lives at
@@ -154,7 +167,8 @@ dead weight — do not resurrect them without new data.
 | **v62** | **a1 + a2_redis_persistence_restored** | pushed 2026-05-29 | re-coupled A to the incident (positive persistence check + deletion-of-required = FAIL); b3 fail-closed for Prometheus rules. Oracle = 1.0. QA then found a2 was still spec-shape only (see v63). |
 | **v63** | **a1 + a2 (+ --dir /data + PVC Bound)** | daydream 5-run: **0.30** (A 3/5, B 0/5) | closed the "durable flags, ephemeral data" bypass: a2 rejects `--dir`≠/data and requires PVC Bound. Oracle = 1.0. B 0/5 was sample noise (see v62). |
 | **v62** (batched) | a1 + a2_redis_persistence_restored | daydream 6-run: **0.42** (A 3/6, B 2/6) | b3 fail-closed first shipped here. B=2/6 proves B is alive (Grafana+receiver passes; Prometheus-only fails). |
-| **v64** | a1 + a2; **P1 issue discloses "alert must page a human"** | pushed 2026-05-30, **not yet batched** | grader UNCHANGED. setup.sh-only: sharpened P1 Notes to disclose (symptom-level) that the alert must reach on-call, closing the b3 under-disclosure that pinned B at ~18%. Target: B → ~40-60%. |
+| **v64** | a1 + a2; **P1 discloses "alert must page a human"** | **biggie-max-nebula 10-run: 0.65 (OVER ceiling)** — A 3/10 (30%), B 10/10 (100% DEAD@1) | disclosure OVER-corrected: all 10 agents cited the hint 10-34x and wired a Grafana receiver. Instruction-level hint → 100% conversion on the strong model. A is healthy/hard; B saturated. |
+| **v65** | a1 + a2; **P1 reverted to v63 oblique text** | pushed 2026-05-30, **not yet batched** | setup.sh-only revert of the v64 disclosure (now byte-identical to v63 setup.sh). Grader UNCHANGED. Target: B off 100% into a varying ~40-70% on biggie → mean ~0.35-0.45. Fallback if B still saturates: harden b2 firing condition (B has no error-prone skill once routing is known). |
 
 ## What to watch on the v62 batch
 
