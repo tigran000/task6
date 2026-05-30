@@ -57,9 +57,17 @@ eval-validated** — awaiting a v62 batch.
 - **A is the reliable difficulty driver** (30% on biggie, ~55% daydream),
   legitimate sidecar-hunt variance (agents miss `cache-config-tuner` /
   `redis-pool-sizer` in-deployment sidecars; confirmed via 2/2-container pods).
-- **B is the volatile one** — swings 18%↔100% on the routing disclosure. b3
-  fail-closed (v62) makes routing mandatory; how much to disclose it is the
-  whole game. v64 over-disclosed (→100%), v65 reverts to oblique.
+- **B is the volatile one** — swings on the routing disclosure: 18% (daydream,
+  oblique) → 100% (biggie, v64 instruction-level) → **40% (biggie, v65 oblique
+  revert — calibrated).** b3 fail-closed (v62) makes routing mandatory; the
+  disclosure altitude is the whole game. v65's oblique P1 text is the sweet spot
+  on biggie.
+- **Current best estimates (biggie-max-nebula, target model):** A ≈ 45% (9/20
+  across v64+v65, identical grader), B ≈ 40% (v65). **Projected mean ≈ 0.42, in
+  band.** v65's observed 0.50 was a high-A sample. NEXT STEP: one more 10-run
+  biggie batch to confirm the mean settles ~0.42-0.45 before treating it as
+  done. Do NOT tighten A on the single 0.50 sample — true mean is already in
+  band; cutting A risks going cold.
 - **SECURITY (cross-version, critical):** QA flagged a hostPath sandbox-escape
   (`kubectl label ns monitoring enforce=privileged` → hostPath pod reads
   `/host/mcp_server/.../solution.sh` + grader + kubeconfig). Root cause is the
@@ -168,7 +176,7 @@ dead weight — do not resurrect them without new data.
 | **v63** | **a1 + a2 (+ --dir /data + PVC Bound)** | daydream 5-run: **0.30** (A 3/5, B 0/5) | closed the "durable flags, ephemeral data" bypass: a2 rejects `--dir`≠/data and requires PVC Bound. Oracle = 1.0. B 0/5 was sample noise (see v62). |
 | **v62** (batched) | a1 + a2_redis_persistence_restored | daydream 6-run: **0.42** (A 3/6, B 2/6) | b3 fail-closed first shipped here. B=2/6 proves B is alive (Grafana+receiver passes; Prometheus-only fails). |
 | **v64** | a1 + a2; **P1 discloses "alert must page a human"** | **biggie-max-nebula 10-run: 0.65 (OVER ceiling)** — A 3/10 (30%), B 10/10 (100% DEAD@1) | disclosure OVER-corrected: all 10 agents cited the hint 10-34x and wired a Grafana receiver. Instruction-level hint → 100% conversion on the strong model. A is healthy/hard; B saturated. |
-| **v65** | a1 + a2; **P1 reverted to v63 oblique text** | pushed 2026-05-30, **not yet batched** | setup.sh-only revert of the v64 disclosure (now byte-identical to v63 setup.sh). Grader UNCHANGED. Target: B off 100% into a varying ~40-70% on biggie → mean ~0.35-0.45. Fallback if B still saturates: harden b2 firing condition (B has no error-prone skill once routing is known). |
+| **v65** | a1 + a2; **P1 reverted to v63 oblique text** | **biggie-max-nebula 10-run: 0.50** — A 6/10 (60%), B 4/10 (40%) | revert WORKED: B 100%→40% (varying, calibrated). A sampled high (60% vs v64's 30% on identical grader → true A ≈ 9/20 = 45%). True mean ≈ 0.5·0.45+0.5·0.40 = **~0.42 (in band)**; observed 0.50 is a high-A sampling artifact at the edge. Both subscores now vary on the target model. |
 
 ## What to watch on the v62 batch
 
