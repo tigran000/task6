@@ -97,10 +97,12 @@ eval-validated** — awaiting a v62 batch.
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** **v66** (local only, not yet pushed — 2026-05-31:
-  Dockerfile `ALLOWED_NAMESPACES` gitea drop, grader unchanged from v65/v63).
-  Last pushed: **v65** (2026-05-30, local commit `387b891`).
-  Prior: v64 `2287fdb`, v63 `d76a0cb`, v62 `239c9b1`.
+- **Current version:** **v67** (pushed 2026-05-31): b2 determinism widening
+  (Prometheus poll 60→120s, Grafana metric-wait 60→90s + 15s settle) to stop
+  false-negatives on correct-but-slow rules. Oracle unaffected (fast aof rule).
+  v66 (pushed 2026-05-31): Dockerfile `ALLOWED_NAMESPACES` gitea drop.
+  Last grader-logic change before v67: v63 (a2 --dir/PVC). v65 `387b891`,
+  v64 `2287fdb`, v63 `d76a0cb`, v62 `239c9b1`.
 - **MODEL MATTERS — two model regimes seen:**
   - **daydream** (v62+v63, 11 rollouts): A ~55%, B ~18% (low). Weaker model.
   - **biggie-max-nebula** (v64, 10 rollouts — the TARGET): A 30%, B 100%.
@@ -232,7 +234,8 @@ dead weight — do not resurrect them without new data.
 | **v62** (batched) | a1 + a2_redis_persistence_restored | daydream 6-run: **0.42** (A 3/6, B 2/6) | b3 fail-closed first shipped here. B=2/6 proves B is alive (Grafana+receiver passes; Prometheus-only fails). |
 | **v64** | a1 + a2; **P1 discloses "alert must page a human"** | **biggie-max-nebula 10-run: 0.65 (OVER ceiling)** — A 3/10 (30%), B 10/10 (100% DEAD@1) | disclosure OVER-corrected: all 10 agents cited the hint 10-34x and wired a Grafana receiver. Instruction-level hint → 100% conversion on the strong model. A is healthy/hard; B saturated. |
 | **v65** | a1 + a2; **P1 reverted to v63 oblique text** | **biggie-max-nebula 10-run: 0.50** — A 6/10 (60%), B 4/10 (40%) | revert WORKED: B 100%→40% (varying, calibrated). A sampled high (60% vs v64's 30% on identical grader → true A ≈ 9/20 = 45%). True mean ≈ 0.5·0.45+0.5·0.40 = **~0.42 (in band)**; observed 0.50 is a high-A sampling artifact at the edge. Both subscores now vary on the target model. |
-| **v66** | a1 + a2 (grader **unchanged** from v65/v63) | local only, not eval'd | **security-only:** Dockerfile `ALLOWED_NAMESPACES` drops `gitea`. Score effect 0.00. Review/QC of v65 (16.5/20, "revise") found A-side tightening inert/DEAD@1 (see "A-lever exhaustion") → ceiling fix is a re-batch, not an A cut. |
+| **v66** | a1 + a2 (grader **unchanged** from v65/v63) | daydream 5-run (OFF-TARGET): 0.10 (A 1/4, B 0/4, run3 infra crash) | **security-only:** Dockerfile `ALLOWED_NAMESPACES` drops `gitea`. Score effect 0.00. Review/QC of v65 (16.5/20, "revise") found A-side tightening inert/DEAD@1 (see "A-lever exhaustion") → ceiling fix is a re-batch, not an A cut. The auto-run daydream batch is off-target (calibrate on biggie); one rollout died on a harness TooSlowError. |
+| **v67** | a1 + a2; **b2 timeouts widened** (Prom poll 60→120s, Grafana metric-wait 60→90s, settle 2→15s) | pushed 2026-05-31, not eval'd | determinism fix for QC point 6 (v65 run4's Prometheus rule false-failed "no transition in 60s"). Reduces b2 false-negatives on correct-but-slow rules; only widens the window, does not relax the transition requirement. Oracle = 1.0 (fast aof_enabled Grafana rule, more time only helps). Zero effect on v65 observed dist (run4 also failed b3). **Still needs a 10-run biggie batch** for the ceiling question. |
 
 ## What to watch on the v62 batch
 

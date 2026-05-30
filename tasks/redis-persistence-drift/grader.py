@@ -1218,11 +1218,17 @@ def _b2_prometheus_path(rule, pod):
     snapshot = _snapshot_persistence_config(pod)
     try:
         _inject_persistence_failure(pod)
-        fired, state = _poll_alert_pending_or_firing(rule_name, timeout=60)
+        # 120s (was 60s, v67): a correct Prometheus rule can need a full
+        # scrape interval (15-30s) + rule-eval interval (~15s) + its `for:`
+        # clause before it surfaces in /api/v1/alerts. 60s clipped genuinely-
+        # correct slow rules (v65 run4 false-negative). Pending still counts,
+        # so this only widens the window for real rules, it does not relax the
+        # transition requirement.
+        fired, state = _poll_alert_pending_or_firing(rule_name, timeout=120)
         if fired:
             return True, ("alert %s transitioned %s -> %s under injection" %
                           (rule_name, pre_state, state))
-        return False, ("alert %s did not transition out of %s within 60s "
+        return False, ("alert %s did not transition out of %s within 120s "
                        "of synthetic failure injection" % (rule_name, pre_state))
     finally:
         _restore_persistence_config(pod, snapshot)
@@ -1269,10 +1275,14 @@ def _b2_grafana_path(rule, pod):
     snapshot = _snapshot_persistence_config(pod)
     try:
         _inject_persistence_failure(pod)
-        _wait_for_metric_value("redis_aof_enabled", 0, timeout=60)
-        # One extra second of polling so the latest scrape lands and the
-        # instant query reflects the post-injection value.
-        time.sleep(2)
+        # 90s (was 60s, v67): match the widened Prometheus-path window so a
+        # slow scrape cycle does not false-negative a correct Grafana rule.
+        _wait_for_metric_value("redis_aof_enabled", 0, timeout=90)
+        # One full scrape interval of settle (was 2s) so the latest scrape
+        # lands and the instant query reflects the post-injection value even
+        # when the rule keys on a metric (e.g. rdb_changes) that lags
+        # redis_aof_enabled by a scrape.
+        time.sleep(15)
         post_val = _prom_instant_value(expr)
         post_fires = (False if post_val is None
                       else bool(_evaluate_threshold(op, threshold_val, post_val)))
