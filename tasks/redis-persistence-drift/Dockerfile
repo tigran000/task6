@@ -23,4 +23,10 @@ ENV DISPLAY_NUM=1
 ENV COMPUTER_HEIGHT_PX=768
 ENV COMPUTER_WIDTH_PX=1024
 
-ENV ALLOWED_NAMESPACES="bleater,monitoring,argocd,gitea"
+# gitea dropped from the allow-list: the task only ever reaches Gitea over
+# HTTP (gitea.devops.local:3000), never via `kubectl -n gitea`, so the agent
+# needs no kube access to that namespace. Dropping it is a task-side partial
+# mitigation for the cross-namespace hostPath sandbox-escape QA flagged
+# (privileged-pod read of the answer-key files). monitoring stays (B needs
+# it); argocd stays (agents re-enable auto-sync via `kubectl -n argocd`).
+ENV ALLOWED_NAMESPACES="bleater,monitoring,argocd"

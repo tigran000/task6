@@ -1,11 +1,61 @@
 # HANDOFF — redis-persistence-drift
 
-**Last updated:** 2026-05-30 (post-v63 push: a2 hardened with --dir /data +
-PVC-Bound checks, closing an ephemeral-data bypass QA found in v62).
+**Last updated:** 2026-05-31 (v66 local: security-only change — dropped `gitea`
+from `ALLOWED_NAMESPACES` (Dockerfile). NO grader change. Review + QC of the
+v65 10-run batch (mean 0.50, at the strict ceiling) concluded the only honest
+ceiling lever is a re-batch, not an A cut — see "A-lever exhaustion" below.)
 
-## TL;DR
+## TL;DR — v66 (current local), grader == v65/v63
 
-v63 is the current live version. **v63** closed a follow-up QA finding
+**v66 changes ONE agent-visible thing and nothing in the grader:** Dockerfile
+`ALLOWED_NAMESPACES` drops `gitea` → `"bleater,monitoring,argocd"`. Partial
+mitigation for the cross-namespace hostPath sandbox-escape (the task only ever
+reaches Gitea over HTTP, never `kubectl -n gitea`; verified no `kubectl -n
+gitea` in grader/setup/solution/task.yaml). `monitoring` stays (B needs it),
+`argocd` stays (agents re-enable auto-sync via `kubectl -n argocd`). Score
+effect: **0.00**. Not yet pushed/eval-validated.
+
+**v65 review verdict (NEEDS WORK → security-only fix applied):** 10-run biggie
+batch mean = **0.50**, exactly ON the strict `0 < X < 0.50` ceiling. A 6/10
+(60%), B 4/10 (40%). Both subscores vary; failures are diverse and legitimate;
+no answer leakage beyond intentional symptom-level P1 hints; equal binary
+weights; polling not sleeps. The 0.50 is an **A-high sample** (A was 30% on
+v64's identical grader → true A ≈ 45%, true mean ≈ **0.42, in band**). QC score
+16.5/20 (82.5%), verdict "revise" — the one blocking item was the ceiling
+proximity, addressed by re-batch, not by cutting A (see below).
+
+### A-lever exhaustion (why we did NOT tighten A on the 0.50 sample)
+
+A's pass/fail is governed **solely by the reverter hunt (a1)**. a2 and any
+behavioral sibling are downstream of the same precondition and add zero
+variance. Specifically:
+
+- **Behavioral restart/drift probe is inert.** A pod restart reloads redis from
+  the sts spec; a2 already asserts that spec is durable (`--appendonly yes`,
+  non-empty `--save`, `--dir /data`, Bound PVC). So a restart probe passes
+  exactly when a2 passes and fails exactly when a2 fails — it cannot diverge.
+  Confirmed historically: v42 behavioral drift-injection on a2 caught 0/5;
+  `data_survives_pod_restart` went DEAD@1.
+- **Every discrete fair A axis is exhausted or dead:** `no_orphan_watchdog_rbac`
+  and `argocd_application_synced` already went DEAD@1; a 4th same-shape reverter
+  adds zero variance (bank anti-pattern 23); init-container reverter is both too
+  strict (~20% find) AND mechanically broken for redis (init runs before redis
+  is up, `CONFIG SET` can't connect); hidden-process (0-5%) and Gitea API
+  objects (0-10%) are dead weight.
+- **Conclusion:** cutting A on a single 0.50 sample risks going cold (true mean
+  already ~0.42). NEXT STEP unchanged: pull one more 10-run biggie batch. If the
+  combined ≥20-rollout mean stays at/above 0.50, the only honest lever is a1 via
+  a NEW mechanism axis — realistically an init-container sts-patch-watchdog
+  variant accepted as a strict ~20%-find multiplication item, validated
+  empirically (do NOT add pre-emptively). Loosening b3 is the wrong direction
+  (raises B → pushes mean further over the ceiling); disclosing routing is the
+  v64 trap (B → 100%, mean → 0.80).
+
+---
+
+## TL;DR (historical, v63)
+
+**v63** closed a follow-up QA finding
 (warning) on v62: `_a2` was still spec-shape only — it checked
 `--appendonly`/`--save`/the `data` VCT but never `--dir`, so an agent who
 flipped the flags in place while leaving the watchdog reverter's `--dir /tmp`
@@ -47,7 +97,9 @@ eval-validated** — awaiting a v62 batch.
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** **v65** (pushed 2026-05-30). Local commit `387b891`.
+- **Current version:** **v66** (local only, not yet pushed — 2026-05-31:
+  Dockerfile `ALLOWED_NAMESPACES` gitea drop, grader unchanged from v65/v63).
+  Last pushed: **v65** (2026-05-30, local commit `387b891`).
   Prior: v64 `2287fdb`, v63 `d76a0cb`, v62 `239c9b1`.
 - **MODEL MATTERS — two model regimes seen:**
   - **daydream** (v62+v63, 11 rollouts): A ~55%, B ~18% (low). Weaker model.
@@ -68,14 +120,17 @@ eval-validated** — awaiting a v62 batch.
   biggie batch to confirm the mean settles ~0.42-0.45 before treating it as
   done. Do NOT tighten A on the single 0.50 sample — true mean is already in
   band; cutting A risks going cold.
-- **SECURITY (cross-version, critical):** QA flagged a hostPath sandbox-escape
-  (`kubectl label ns monitoring enforce=privileged` → hostPath pod reads
-  `/host/mcp_server/.../solution.sh` + grader + kubeconfig). Root cause is the
-  base image's `protect-pss-labels` VAP exempting monitoring/gitea + the
-  ubuntu-user wildcard RBAC — **harness-level, not the grader**, affects every
-  version. Task-side partial: drop `gitea` from `ALLOWED_NAMESPACES` (Dockerfile;
-  the task only uses Gitea over HTTP, never kubectl -n gitea). `monitoring` must
-  stay (B needs it) so the full fix needs the platform team. Not yet actioned.
+- **SECURITY (cross-version, critical) — PARTIALLY ACTIONED in v66:** QA flagged
+  a hostPath sandbox-escape (`kubectl label ns monitoring enforce=privileged` →
+  hostPath pod reads `/host/mcp_server/.../solution.sh` + grader + kubeconfig).
+  Root cause is the base image's `protect-pss-labels` VAP exempting
+  monitoring/gitea + the ubuntu-user wildcard RBAC — **harness-level, not the
+  grader**, affects every version. **v66 task-side partial DONE:** dropped
+  `gitea` from `ALLOWED_NAMESPACES` (the task only uses Gitea over HTTP, never
+  `kubectl -n gitea`). `monitoring` must stay (B needs it), so the
+  monitoring-exemption leg of the escape is **still open** and needs the
+  platform team (base-image VAP fix). Re-confirm the full fix before treating
+  the security item as closed.
 - **VM:** `tigranharutyunyan59@34.186.153.63`, task files at
   **`~/tasks/redis-persistence-drift/`** (NOT `~/task/` — the old HANDOFF was
   wrong and it cost a session's worth of confusion). horizon CLI lives at
@@ -177,6 +232,7 @@ dead weight — do not resurrect them without new data.
 | **v62** (batched) | a1 + a2_redis_persistence_restored | daydream 6-run: **0.42** (A 3/6, B 2/6) | b3 fail-closed first shipped here. B=2/6 proves B is alive (Grafana+receiver passes; Prometheus-only fails). |
 | **v64** | a1 + a2; **P1 discloses "alert must page a human"** | **biggie-max-nebula 10-run: 0.65 (OVER ceiling)** — A 3/10 (30%), B 10/10 (100% DEAD@1) | disclosure OVER-corrected: all 10 agents cited the hint 10-34x and wired a Grafana receiver. Instruction-level hint → 100% conversion on the strong model. A is healthy/hard; B saturated. |
 | **v65** | a1 + a2; **P1 reverted to v63 oblique text** | **biggie-max-nebula 10-run: 0.50** — A 6/10 (60%), B 4/10 (40%) | revert WORKED: B 100%→40% (varying, calibrated). A sampled high (60% vs v64's 30% on identical grader → true A ≈ 9/20 = 45%). True mean ≈ 0.5·0.45+0.5·0.40 = **~0.42 (in band)**; observed 0.50 is a high-A sampling artifact at the edge. Both subscores now vary on the target model. |
+| **v66** | a1 + a2 (grader **unchanged** from v65/v63) | local only, not eval'd | **security-only:** Dockerfile `ALLOWED_NAMESPACES` drops `gitea`. Score effect 0.00. Review/QC of v65 (16.5/20, "revise") found A-side tightening inert/DEAD@1 (see "A-lever exhaustion") → ceiling fix is a re-batch, not an A cut. |
 
 ## What to watch on the v62 batch
 
