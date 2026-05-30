@@ -482,11 +482,16 @@ if [ -n "$GITEA_TOKEN" ]; then
 
 ### Notes
 We had no alerting on this layer at all and got blindsided — Postgres
-was on fire for hours before anyone noticed. Whatever caused this
-cannot be allowed to recur, and do not be surprised if hotfixes get
-quietly rolled back by the platform reconciliation loop — make sure
-your changes land somewhere they will stick. The next on-call should
-not be left with a confusing topology either.
+was on fire for hours before anyone noticed. Whatever you put in to
+catch this next time actually has to reach the on-call rotation: last
+night the gap was that nothing paged a human, so a rule that just
+evaluates in the background or lights up a dashboard nobody is staring
+at is no better than what we have now. Wire it so it would genuinely
+notify someone. Whatever caused this cannot be allowed to recur, and
+do not be surprised if hotfixes get quietly rolled back by the platform
+reconciliation loop — make sure your changes land somewhere they will
+stick. The next on-call should not be left with a confusing topology
+either.
 EOF
 )
   P1_JSON=$(python3 -c "import json,sys; print(json.dumps({'title':'P1 — Bleater feed loading slowly, DB CPU pegged','body':sys.stdin.read()}))" <<<"$P1_BODY")
