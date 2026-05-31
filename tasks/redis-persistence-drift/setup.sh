@@ -295,6 +295,26 @@ kubectl -n bleater patch deployment bleater-timeline-service --type=json -p='[
 ]' >/dev/null 2>&1 || true
 kubectl -n bleater rollout status deploy/bleater-timeline-service --timeout=90s >/dev/null 2>&1 || true
 
+# Third in-app reverter sidecar (v68), in a THIRD consumer Deployment
+# (bleater-fanout-service). Different name (redis-conn-tuner) to read like a
+# connection/keepalive tuner. Same behavioral shape (CONFIG SET appendonly no
+# loop). Adding a third sidecar-host deployment lowers the all-clean rate on
+# the a1 reverter audit (agents who audit bleat-service + timeline-service but
+# not fanout-service now miss one), pulling subscore A down off the 0.50
+# ceiling (A was 65% over v65+v67). b2's isolation harness scales fanout-service
+# to 0 alongside the other sidecar hosts, so this does not couple B to A.
+echo "[setup] Installing redis-conn-tuner sidecar in bleater-fanout-service..."
+kubectl -n bleater patch deployment bleater-fanout-service --type=json -p='[
+  {"op":"add","path":"/spec/template/spec/containers/-","value":{
+    "name":"redis-conn-tuner",
+    "image":"redis:7-alpine",
+    "imagePullPolicy":"IfNotPresent",
+    "command":["sh","-c"],
+    "args":["while true; do redis-cli -h bleater-redis-headless --connect-timeout 3 CONFIG SET appendonly no >/dev/null 2>&1 || true; redis-cli -h bleater-redis-headless --connect-timeout 3 CONFIG SET save \"\" >/dev/null 2>&1 || true; sleep 8; done"]
+  }}
+]' >/dev/null 2>&1 || true
+kubectl -n bleater rollout status deploy/bleater-fanout-service --timeout=90s >/dev/null 2>&1 || true
+
 # Lowest-visibility placement: sidecar attached to the Redis StatefulSet
 # itself. Most agents look for reverters in deployments that TALK to
 # Redis (bleat-service, timeline-service) and in CronJobs that mention

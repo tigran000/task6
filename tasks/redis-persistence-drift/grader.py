@@ -164,6 +164,13 @@ _REVERTER_SIDECAR_RESOURCES = [
     #              the strongest cleanup signal.
     ("deploy", "bleater-bleat-service", NS, "required"),
     ("deploy", "bleater-timeline-service", NS, "required"),
+    # v68: third consumer sidecar host. Agents who audit bleat-service +
+    # timeline-service but not fanout-service now miss a reverter, lowering
+    # a1's all-clean rate (subscore A was 65% over v65+v67 → mean pinned at
+    # the 0.50 ceiling). fanout-service is a real, always-present Deployment,
+    # so a silently-failed setup patch leaves it sidecar-free (audited clean),
+    # never "absent" → no catastrophic A→0.
+    ("deploy", "bleater-fanout-service", NS, "required"),
     ("sts", "bleater-redis", NS, "required"),
     ("cronjob", "cache-config-syncer", NS, "reverter"),
     ("cronjob", "redis-fsync-tuner", PROM_NS, "reverter"),
@@ -997,7 +1004,18 @@ _REVERTER_CRONJOBS = [
     ("monitoring", "redis-fsync-tuner"),
     ("bleater", "cache-config-syncer"),
 ]
-_BLEAT_SERVICE_DEPLOY = "bleater-bleat-service"
+# Deployments that host an agent-cleanable reverter sidecar (cache-config-
+# tuner in bleat-service, redis-pool-sizer in timeline-service, redis-conn-
+# tuner in fanout-service). b2's isolation harness scales ALL of them to 0 for
+# the measurement window so ANY sidecar the agent failed to remove cannot
+# re-assert CONFIG SET appendonly no while we measure — keeping B's outcome
+# independent of A regardless of which sidecars survived. (v68: was bleat-
+# service only, which left the timeline/fanout sidecars un-neutralized.)
+_SIDECAR_HOST_DEPLOYS = [
+    "bleater-bleat-service",
+    "bleater-timeline-service",
+    "bleater-fanout-service",
+]
 _GOOD_STS_COMMAND = [
     "redis-server",
     "--save", "3600 1 300 100 60 10000",
@@ -1028,16 +1046,16 @@ def _unsuspend_reverter_cronjobs(suspended):
              "-p", '{"spec":{"suspend":false}}'], timeout=15)
 
 
-def _bleat_service_replicas():
-    out = kubectl_jsonpath(["get", "deploy", _BLEAT_SERVICE_DEPLOY], "{.spec.replicas}")
+def _deploy_replicas(deploy):
+    out = kubectl_jsonpath(["get", "deploy", deploy], "{.spec.replicas}")
     try:
         return int(out)
     except Exception:
         return None
 
 
-def _scale_bleat_service(replicas):
-    run(KUBECTL + ["scale", "deploy", _BLEAT_SERVICE_DEPLOY,
+def _scale_deploy(deploy, replicas):
+    run(KUBECTL + ["scale", "deploy", deploy,
                     "--replicas=%d" % replicas], timeout=30)
 
 
@@ -1139,16 +1157,23 @@ def _isolate_cluster_for_b2():
     unaffected and the post-b2 cluster matches the agent's final state."""
     state = {
         "suspended_cronjobs": _suspend_reverter_cronjobs(),
-        "bleat_service_replicas": _bleat_service_replicas(),
+        "sidecar_host_replicas": {d: _deploy_replicas(d)
+                                  for d in _SIDECAR_HOST_DEPLOYS},
         "sts_command": _snapshot_sts_command(),
         "sts_containers": _snapshot_sts_containers(),
     }
-    # Scale bleat-service to 0 so the cache-config-tuner sidecar pod (if
-    # still attached) cannot keep re-asserting CONFIG SET appendonly no
-    # via redis-cli during our measurement window.
-    if state["bleat_service_replicas"] and state["bleat_service_replicas"] > 0:
-        _scale_bleat_service(0)
-        _wait_for_deploy_replicas(_BLEAT_SERVICE_DEPLOY, 0, timeout=60)
+    # Scale every sidecar-host deployment to 0 so that ANY agent-left reverter
+    # sidecar (cache-config-tuner / redis-pool-sizer / redis-conn-tuner) cannot
+    # keep re-asserting CONFIG SET appendonly no via redis-cli during our
+    # measurement window. Issue all scale-downs first, then wait, so they drain
+    # in parallel. Makes B independent of A regardless of which sidecars the
+    # agent failed to remove.
+    for d, rep in state["sidecar_host_replicas"].items():
+        if rep and rep > 0:
+            _scale_deploy(d, 0)
+    for d, rep in state["sidecar_host_replicas"].items():
+        if rep and rep > 0:
+            _wait_for_deploy_replicas(d, 0, timeout=60)
     # Strip any sidecar containers from the sts pod template so an
     # in-pod reverter (e.g. redis-metrics-exporter) cannot fight us.
     containers = state.get("sts_containers") or []
@@ -1186,9 +1211,9 @@ def _restore_cluster_after_b2(state):
         _patch_sts_containers(state["sts_containers"])
     if state.get("sts_command"):
         _patch_sts_command(state["sts_command"])
-    rep = state.get("bleat_service_replicas")
-    if rep and rep > 0:
-        _scale_bleat_service(rep)
+    for d, rep in (state.get("sidecar_host_replicas") or {}).items():
+        if rep and rep > 0:
+            _scale_deploy(d, rep)
     _unsuspend_reverter_cronjobs(state.get("suspended_cronjobs") or [])
 
 

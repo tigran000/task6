@@ -97,12 +97,16 @@ eval-validated** — awaiting a v62 batch.
 - **Task UUID:** `879b4f36-f5a2-4194-8a68-ee11c7af3a8f`
 - **Mini-batch (create-permitted):** `99a0adf0-abfe-4fcf-9c65-74f40b2f9cb5`
   (legacy `5018ad80-…` is version-push-only — 403s on create)
-- **Current version:** **v67** (pushed 2026-05-31): b2 determinism widening
-  (Prometheus poll 60→120s, Grafana metric-wait 60→90s + 15s settle) to stop
-  false-negatives on correct-but-slow rules. Oracle unaffected (fast aof rule).
-  v66 (pushed 2026-05-31): Dockerfile `ALLOWED_NAMESPACES` gitea drop.
-  Last grader-logic change before v67: v63 (a2 --dir/PVC). v65 `387b891`,
-  v64 `2287fdb`, v63 `d76a0cb`, v62 `239c9b1`.
+- **Current version:** **v68** (pushed 2026-05-31): **A-difficulty bump** —
+  third reverter sidecar `redis-conn-tuner` planted in `bleater-fanout-service`
+  (setup.sh), audited in a1 (`_REVERTER_SIDECAR_RESOURCES`), cleaned by the
+  oracle (solution.sh). b2 isolation harness generalized to scale ALL sidecar
+  hosts (bleat-service + timeline-service + fanout-service) to 0 during the
+  measurement window (was bleat-service only) so the new sidecar can't couple B
+  to A. Goal: pull subscore A from ~65% toward ~50%, mean 0.50 → ~0.43.
+  v67 (pushed 2026-05-31): b2 timeout widening (Prom 60→120s, Grafana 60→90s,
+  settle 2→15s). v66: gitea drop from `ALLOWED_NAMESPACES`.
+  Last grader-logic change before v67: v63 (a2 --dir/PVC). v65 `387b891`.
 - **MODEL MATTERS — two model regimes seen:**
   - **daydream** (v62+v63, 11 rollouts): A ~55%, B ~18% (low). Weaker model.
   - **biggie-max-nebula** (v64, 10 rollouts — the TARGET): A 30%, B 100%.
@@ -235,7 +239,8 @@ dead weight — do not resurrect them without new data.
 | **v64** | a1 + a2; **P1 discloses "alert must page a human"** | **biggie-max-nebula 10-run: 0.65 (OVER ceiling)** — A 3/10 (30%), B 10/10 (100% DEAD@1) | disclosure OVER-corrected: all 10 agents cited the hint 10-34x and wired a Grafana receiver. Instruction-level hint → 100% conversion on the strong model. A is healthy/hard; B saturated. |
 | **v65** | a1 + a2; **P1 reverted to v63 oblique text** | **biggie-max-nebula 10-run: 0.50** — A 6/10 (60%), B 4/10 (40%) | revert WORKED: B 100%→40% (varying, calibrated). A sampled high (60% vs v64's 30% on identical grader → true A ≈ 9/20 = 45%). True mean ≈ 0.5·0.45+0.5·0.40 = **~0.42 (in band)**; observed 0.50 is a high-A sampling artifact at the edge. Both subscores now vary on the target model. |
 | **v66** | a1 + a2 (grader **unchanged** from v65/v63) | daydream 5-run (OFF-TARGET): 0.10 (A 1/4, B 0/4, run3 infra crash) | **security-only:** Dockerfile `ALLOWED_NAMESPACES` drops `gitea`. Score effect 0.00. Review/QC of v65 (16.5/20, "revise") found A-side tightening inert/DEAD@1 (see "A-lever exhaustion") → ceiling fix is a re-batch, not an A cut. The auto-run daydream batch is off-target (calibrate on biggie); one rollout died on a harness TooSlowError. |
-| **v67** | a1 + a2; **b2 timeouts widened** (Prom poll 60→120s, Grafana metric-wait 60→90s, settle 2→15s) | pushed 2026-05-31, not eval'd | determinism fix for QC point 6 (v65 run4's Prometheus rule false-failed "no transition in 60s"). Reduces b2 false-negatives on correct-but-slow rules; only widens the window, does not relax the transition requirement. Oracle = 1.0 (fast aof_enabled Grafana rule, more time only helps). Zero effect on v65 observed dist (run4 also failed b3). **Still needs a 10-run biggie batch** for the ceiling question. |
+| **v67** | a1 + a2; **b2 timeouts widened** (Prom poll 60→120s, Grafana metric-wait 60→90s, settle 2→15s) | **biggie 10-run: 0.50** — A 7/10, B 3/10, all 10 runs == 0.5 | determinism fix for QC point 6 worked (no timing false-negative; the one b2 fail was a malformed empty-vector expr). Combined v65+v67 = **20 on-target runs, mean 0.50, A 13/20=65%, B 7/20=35%.** Refutes the "true mean ~0.42" hope: A is genuinely ~65% (too easy) → mean pinned AT the 0.50 ceiling. Failure diversity excellent (1 A mode, 5 B modes). Reviewer NEEDS WORK / QC 17.5/20 "revise": sole blocker = A too easy. |
+| **v68** | **a1 + a2 + 3rd sidecar (fanout-service)**; b2 harness scales all 3 sidecar hosts | pushed 2026-05-31, not eval'd | A-difficulty bump: `redis-conn-tuner` sidecar in `bleater-fanout-service` (real always-present deploy → silent-patch-fail is safe, audits clean not "absent"). Lowers a1 all-clean rate (now 3 sidecar hosts + 3 cronjobs + sts to audit). Harness generalized to scale bleat+timeline+fanout to 0 in b2 (fixes latent timeline gap, keeps B⊥A). Oracle = 1.0 (solution.sh cleans the 3rd sidecar). **Predicted A ~50-55%, mean ~0.43-0.45.** Validate with a 10-run biggie batch; watch A doesn't go cold (<40%) and B stays ~35% (independence intact). |
 
 ## What to watch on the v62 batch
 

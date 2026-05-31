@@ -28,16 +28,17 @@ kubectl -n monitoring delete serviceaccount redis-config-watchdog --ignore-not-f
 kubectl -n monitoring delete cronjob redis-fsync-tuner --ignore-not-found >/dev/null 2>&1 || true
 kubectl -n monitoring delete job -l app=redis-fsync-tuner --ignore-not-found >/dev/null 2>&1 || true
 
-# Reverters 3 + 4: in-app sidecars (cache-config-tuner in
-# bleater-bleat-service, redis-pool-sizer in bleater-timeline-service).
-# Both are 5-7s loops that flip CONFIG SET appendonly no on the headless
-# service. Must go before we restart Redis, otherwise either sidecar
-# would re-disable persistence within seconds.
+# Reverters 3-5: in-app sidecars (cache-config-tuner in
+# bleater-bleat-service, redis-pool-sizer in bleater-timeline-service,
+# redis-conn-tuner in bleater-fanout-service). All are 5-8s loops that flip
+# CONFIG SET appendonly no on the headless service. Must go before we restart
+# Redis, otherwise any sidecar would re-disable persistence within seconds.
 # Targeted JSON patch by container index (looked up via jsonpath +
 # awk) — symmetric with setup.sh's `op:add /spec/template/spec/
 # containers/-` insertion. Fails loud on patch error.
 for entry in "bleater-bleat-service cache-config-tuner" \
-             "bleater-timeline-service redis-pool-sizer"; do
+             "bleater-timeline-service redis-pool-sizer" \
+             "bleater-fanout-service redis-conn-tuner"; do
   set -- $entry
   DEPLOY="$1"
   SIDECAR="$2"
